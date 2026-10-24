@@ -1,3 +1,4 @@
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -59,7 +60,7 @@ static void add_line(TerminalBuffer *buffer, const char *text)
     }
 }
 
-/* Add command output while preserving line boundaries. */
+/* Split command output into lines while preserving incomplete lines. */
 static void consume_output(
     TerminalBuffer *buffer,
     const char *data,
@@ -85,10 +86,76 @@ static void consume_output(
 }
 
 /*
- * Start a simple external command without blocking the X11 event loop.
- * This parser splits arguments on spaces and tabs only.
- * Quotes, pipes, redirection, and built-ins are not implemented yet.
+ * Basic command parser.
+ * - Spaces separate arguments outside quotes.
+ * - Single and double quotes group text and are removed.
+ * - Backslash escapes the next character outside single quotes.
+ *
+ * This is not a full Bash parser yet.
  */
+static int parse_command(char *command, char *argv[], int max_args)
+{
+    char *read_pos = command;
+    char *write_pos = command;
+    int argc = 0;
+
+    while (*read_pos != '\0') {
+        while (*read_pos == ' ' ||
+               *read_pos == '\t' ||
+               *read_pos == '\n') {
+            read_pos++;
+        }
+
+        if (*read_pos == '\0') {
+            break;
+        }
+
+        if (argc >= max_args - 1) {
+            break;
+        }
+
+        argv[argc++] = write_pos;
+        char quote = '\0';
+
+        while (*read_pos != '\0') {
+            char ch = *read_pos++;
+
+            if (quote == '\0' &&
+                (ch == ' ' || ch == '\t' || ch == '\n')) {
+                break;
+            }
+
+            if (quote == '\0' &&
+                (ch == '\'' || ch == '"')) {
+                quote = ch;
+                continue;
+            }
+
+            if (quote != '\0' && ch == quote) {
+                quote = '\0';
+                continue;
+            }
+
+            if (ch == '\\' && quote != '\'') {
+                if (*read_pos != '\0') {
+                    *write_pos++ = *read_pos++;
+                } else {
+                    *write_pos++ = '\\';
+                }
+                continue;
+            }
+
+            *write_pos++ = ch;
+        }
+
+        *write_pos++ = '\0';
+    }
+
+    argv[argc] = NULL;
+    return argc;
+}
+
+/* Start an external command without blocking the GUI. */
 static int start_command(
     TerminalBuffer *buffer,
     ActiveCommand *state,
@@ -104,16 +171,7 @@ static int start_command(
     snprintf(command_copy, sizeof(command_copy), "%s", command);
 
     char *argv[MAX_ARGS];
-    int argc = 0;
-    char *saveptr = NULL;
-    char *token = strtok_r(command_copy, " \t", &saveptr);
-
-    while (token != NULL && argc < MAX_ARGS - 1) {
-        argv[argc++] = token;
-        token = strtok_r(NULL, " \t", &saveptr);
-    }
-
-    argv[argc] = NULL;
+    int argc = parse_command(command_copy, argv, MAX_ARGS);
 
     if (argc == 0) {
         add_line(buffer, "Empty command.");
@@ -121,6 +179,7 @@ static int start_command(
     }
 
     int pipefd[2];
+
     if (pipe(pipefd) == -1) {
         add_line(buffer, "Error: pipe() failed.");
         return 0;
@@ -136,7 +195,6 @@ static int start_command(
     }
 
     if (pid == 0) {
-        /* Child: redirect stdout and stderr to the pipe. */
         close(pipefd[0]);
 
         if (dup2(pipefd[1], STDOUT_FILENO) == -1 ||
@@ -145,18 +203,20 @@ static int start_command(
         }
 
         close(pipefd[1]);
+
         execvp(argv[0], argv);
 
         dprintf(STDERR_FILENO,
                 "terminator: %s: command not found or could not execute\n",
                 argv[0]);
+
         _exit(127);
     }
 
-    /* Parent: configure the pipe's read end for nonblocking reads. */
     close(pipefd[1]);
 
     int flags = fcntl(pipefd[0], F_GETFL, 0);
+
     if (flags == -1 ||
         fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
         close(pipefd[0]);
@@ -207,7 +267,8 @@ static void service_command(
                 break;
             } else if (errno == EINTR) {
                 continue;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            } else if (errno == EAGAIN ||
+                       errno == EWOULDBLOCK) {
                 break;
             } else {
                 add_line(buffer,
@@ -245,14 +306,7 @@ static void service_command(
     }
 }
 
-/* Draw the terminal contents and current input.
- * The title and prompt stay fixed at the top-left.
- * Command history/output is drawn below them so it cannot cover the prompt.
- */
-
-/* Draw terminal output followed by the current prompt at the bottom. */
-
-/* Draw terminal output and place the prompt after the latest output. */
+/* Draw terminal output, then the current prompt immediately after it. */
 static void draw_terminal(
     Display *display,
     Window window,
@@ -273,7 +327,6 @@ static void draw_terminal(
 
     XSetForeground(display, gc, BlackPixel(display, screen));
 
-    /* Draw the title. */
     const char *title = "Terminator - Custom Terminal";
 
     XDrawString(display, window, gc,
@@ -284,7 +337,6 @@ static void draw_terminal(
     int prompt_width = XTextWidth(
         font, PROMPT, (int)strlen(PROMPT));
 
-    /* Reserve space for the prompt at the end of the output. */
     int max_output_lines =
         (window_height - output_top - LINE_HEIGHT - 10) / LINE_HEIGHT;
 
@@ -293,6 +345,7 @@ static void draw_terminal(
     }
 
     int start = buffer->count - max_output_lines;
+
     if (start < 0) {
         start = 0;
     }
@@ -300,7 +353,6 @@ static void draw_terminal(
     int visible_count = buffer->count - start;
     int y = output_top;
 
-    /* Draw the most recent output lines. */
     for (int i = start; i < buffer->count; i++) {
         if (y + LINE_HEIGHT >= window_height) {
             break;
@@ -314,7 +366,6 @@ static void draw_terminal(
         y += LINE_HEIGHT;
     }
 
-    /* Prompt immediately follows the last displayed output line. */
     int prompt_y = output_top + visible_count * LINE_HEIGHT;
 
     if (prompt_y + LINE_HEIGHT >= window_height) {
@@ -332,11 +383,10 @@ static void draw_terminal(
     XFlush(display);
 }
 
-
-
 int main(void)
 {
     Display *display = XOpenDisplay(NULL);
+
     if (display == NULL) {
         fprintf(stderr,
                 "Cannot open X display. Check your DISPLAY environment.\n");
@@ -363,6 +413,7 @@ int main(void)
                  ExposureMask | KeyPressMask | StructureNotifyMask);
 
     GC gc = XCreateGC(display, window, 0, NULL);
+
     if (gc == NULL) {
         fprintf(stderr, "Could not create graphics context.\n");
         XDestroyWindow(display, window);
@@ -371,6 +422,7 @@ int main(void)
     }
 
     XFontStruct *font = XLoadQueryFont(display, "fixed");
+
     if (font == NULL) {
         fprintf(stderr, "Could not load X11 font.\n");
         XFreeGC(display, gc);
@@ -378,9 +430,11 @@ int main(void)
         XCloseDisplay(display);
         return EXIT_FAILURE;
     }
+
     XSetFont(display, gc, font->fid);
 
     TerminalBuffer buffer = {0};
+
     ActiveCommand command_state = {
         .pid = -1,
         .output_fd = -1,
@@ -393,6 +447,7 @@ int main(void)
 
     char input[INPUT_SIZE] = "";
     size_t input_length = 0;
+
     int window_width = WINDOW_WIDTH;
     int window_height = WINDOW_HEIGHT;
     int running = 1;
@@ -410,15 +465,16 @@ int main(void)
         fds[0].events = POLLIN;
         fds[0].revents = 0;
 
-        if (command_state.active && command_state.output_fd != -1) {
+        if (command_state.active &&
+            command_state.output_fd != -1) {
             fds[1].fd = command_state.output_fd;
             fds[1].events = POLLIN | POLLHUP | POLLERR;
             fds[1].revents = 0;
             nfds = 2;
         }
 
-        /* Timeout lets us periodically check child exit status. */
         int ready = poll(fds, nfds, 50);
+
         if (ready == -1 && errno != EINTR) {
             fprintf(stderr, "poll() failed: %s\n", strerror(errno));
             break;
@@ -426,15 +482,12 @@ int main(void)
 
         if (command_state.active) {
             service_command(&buffer, &command_state);
+
             draw_terminal(display, window, gc, screen,
                           window_width, window_height,
                           &buffer, input, font);
         }
 
-        /*
-         * Xlib may already have events buffered internally even when the
-         * underlying connection descriptor is no longer readable.
-         */
         while (XPending(display) > 0) {
             XEvent event;
             XNextEvent(display, &event);
@@ -515,7 +568,7 @@ int main(void)
         }
     }
 
-    /* Clean up a running child when the GUI closes. */
+    /* Clean up an active child if the window is closed. */
     if (command_state.active) {
         (void)kill(command_state.pid, SIGTERM);
 
