@@ -16,16 +16,13 @@
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 500
-
 #define INPUT_SIZE 1024
 #define MAX_LINES 1000
 #define LINE_SIZE 1024
 #define MAX_ARGS 128
-
 #define LEFT_MARGIN 20
-#define TOP_MARGIN 30
+#define TOP_MARGIN 25
 #define LINE_HEIGHT 20
-
 #define PROMPT "user@terminator> "
 
 typedef struct {
@@ -43,55 +40,52 @@ typedef struct {
     size_t partial_length;
 } ActiveCommand;
 
-/* Add a line to the terminal buffer. */
+/* Add a complete line to the terminal history. */
 static void add_line(TerminalBuffer *buffer, const char *text)
 {
-    if (buffer->count < MAX_LINES) {
-        snprintf(buffer->lines[buffer->count],
-                 LINE_SIZE, "%s", text);
-        buffer->count++;
-    } else {
+    if (buffer->count == MAX_LINES) {
         memmove(buffer->lines,
                 buffer->lines + 1,
                 (MAX_LINES - 1) * sizeof(buffer->lines[0]));
-
-        snprintf(buffer->lines[MAX_LINES - 1],
-                 LINE_SIZE, "%s", text);
+        buffer->count--;
     }
+
+    snprintf(buffer->lines[buffer->count],
+             LINE_SIZE, "%s", text);
+    buffer->count++;
 }
 
-/* Split command output into lines while preserving incomplete lines. */
+/* Append output to the history, separating it at newline characters. */
 static void consume_output(
     TerminalBuffer *buffer,
     const char *data,
     size_t length,
-    char *partial_line,
+    char *partial,
     size_t *partial_length)
 {
     for (size_t i = 0; i < length; i++) {
         char ch = data[i];
 
         if (ch == '\n') {
-            partial_line[*partial_length] = '\0';
-            add_line(buffer, partial_line);
+            partial[*partial_length] = '\0';
+            add_line(buffer, partial);
             *partial_length = 0;
-            partial_line[0] = '\0';
+            partial[0] = '\0';
         } else if (ch != '\r') {
             if (*partial_length < LINE_SIZE - 1) {
-                partial_line[*partial_length] = ch;
-                (*partial_length)++;
+                partial[(*partial_length)++] = ch;
             }
         }
     }
 }
 
 /*
- * Basic command parser.
- * - Spaces separate arguments outside quotes.
- * - Single and double quotes group text and are removed.
- * - Backslash escapes the next character outside single quotes.
+ * Basic command parser:
+ * - Splits arguments at whitespace outside quotes.
+ * - Removes matching single and double quotes.
+ * - Handles a backslash escape outside single quotes.
  *
- * This is not a full Bash parser yet.
+ * This is not a complete Bash parser.
  */
 static int parse_command(char *command, char *argv[], int max_args)
 {
@@ -125,8 +119,7 @@ static int parse_command(char *command, char *argv[], int max_args)
                 break;
             }
 
-            if (quote == '\0' &&
-                (ch == '\'' || ch == '"')) {
+            if (quote == '\0' && (ch == '\'' || ch == '"')) {
                 quote = ch;
                 continue;
             }
@@ -155,33 +148,76 @@ static int parse_command(char *command, char *argv[], int max_args)
     return argc;
 }
 
-/* Start an external command without blocking the GUI. */
+/*
+ * Execute cd in the parent process.
+ * Return 1 when the command is handled, otherwise return 0.
+ */
+static int handle_cd(TerminalBuffer *buffer, const char *command)
+{
+    char copy[INPUT_SIZE];
+    snprintf(copy, sizeof(copy), "%s", command);
+
+    char *argv[MAX_ARGS];
+    int argc = parse_command(copy, argv, MAX_ARGS);
+
+    if (argc == 0 || strcmp(argv[0], "cd") != 0) {
+        return 0;
+    }
+
+    if (argc > 2) {
+        add_line(buffer, "cd: too many arguments");
+        return 1;
+    }
+
+    const char *path;
+
+    if (argc == 1) {
+        path = getenv("HOME");
+
+        if (path == NULL || path[0] == '\0') {
+            add_line(buffer, "cd: HOME is not set");
+            return 1;
+        }
+    } else {
+        path = argv[1];
+    }
+
+    if (chdir(path) == -1) {
+        char message[LINE_SIZE];
+
+        snprintf(message, sizeof(message),
+                 "cd: %s: %s", path, strerror(errno));
+        add_line(buffer, message);
+    }
+
+    return 1;
+}
+
+/* Start an external command in a child process. */
 static int start_command(
     TerminalBuffer *buffer,
     ActiveCommand *state,
     const char *command)
 {
     if (state->active) {
-        add_line(buffer,
-                 "A command is already running. Please wait.");
+        add_line(buffer, "A command is already running. Please wait.");
         return 0;
     }
 
-    char command_copy[INPUT_SIZE];
-    snprintf(command_copy, sizeof(command_copy), "%s", command);
+    char copy[INPUT_SIZE];
+    snprintf(copy, sizeof(copy), "%s", command);
 
     char *argv[MAX_ARGS];
-    int argc = parse_command(command_copy, argv, MAX_ARGS);
+    int argc = parse_command(copy, argv, MAX_ARGS);
 
     if (argc == 0) {
-        add_line(buffer, "Empty command.");
         return 0;
     }
 
     int pipefd[2];
 
     if (pipe(pipefd) == -1) {
-        add_line(buffer, "Error: pipe() failed.");
+        add_line(buffer, "Error: pipe() failed");
         return 0;
     }
 
@@ -190,7 +226,7 @@ static int start_command(
     if (pid == -1) {
         close(pipefd[0]);
         close(pipefd[1]);
-        add_line(buffer, "Error: fork() failed.");
+        add_line(buffer, "Error: fork() failed");
         return 0;
     }
 
@@ -207,9 +243,8 @@ static int start_command(
         execvp(argv[0], argv);
 
         dprintf(STDERR_FILENO,
-                "terminator: %s: command not found or could not execute\n",
-                argv[0]);
-
+                "terminator: %s: %s\n",
+                argv[0], strerror(errno));
         _exit(127);
     }
 
@@ -220,13 +255,12 @@ static int start_command(
     if (flags == -1 ||
         fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
         close(pipefd[0]);
-        (void)kill(pid, SIGTERM);
+        kill(pid, SIGTERM);
 
         while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {
         }
 
-        add_line(buffer,
-                 "Error: could not configure nonblocking output.");
+        add_line(buffer, "Error: could not configure output pipe");
         return 0;
     }
 
@@ -241,7 +275,7 @@ static int start_command(
     return 1;
 }
 
-/* Read available output and check whether the child has exited. */
+/* Read command output without blocking the GUI. */
 static void service_command(
     TerminalBuffer *buffer,
     ActiveCommand *state)
@@ -267,12 +301,10 @@ static void service_command(
                 break;
             } else if (errno == EINTR) {
                 continue;
-            } else if (errno == EAGAIN ||
-                       errno == EWOULDBLOCK) {
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             } else {
-                add_line(buffer,
-                         "Error: could not read command output.");
+                add_line(buffer, "Error: reading command output failed");
                 state->pipe_eof = 1;
                 close(state->output_fd);
                 state->output_fd = -1;
@@ -288,12 +320,13 @@ static void service_command(
         if (result == state->pid) {
             state->child_reaped = 1;
         } else if (result == -1 && errno != EINTR) {
-            add_line(buffer, "Error: waitpid() failed.");
+            add_line(buffer, "Error: waitpid() failed");
             state->child_reaped = 1;
         }
     }
 
     if (state->pipe_eof && state->child_reaped) {
+        /* Flush the final output line even if it has no trailing newline. */
         if (state->partial_length > 0) {
             state->partial_line[state->partial_length] = '\0';
             add_line(buffer, state->partial_line);
@@ -306,55 +339,60 @@ static void service_command(
     }
 }
 
-/* Draw terminal output, then the current prompt immediately after it. */
+/*
+ * Draw history in chronological order.
+ * If a command is running, its output is shown as it arrives.
+ * If no command is running, draw the current prompt after history.
+ */
 static void draw_terminal(
     Display *display,
     Window window,
     GC gc,
     int screen,
-    int window_width,
-    int window_height,
+    int width,
+    int height,
     const TerminalBuffer *buffer,
     const char *input,
+    int command_active,
     XFontStruct *font)
 {
     XSetForeground(display, gc, WhitePixel(display, screen));
-
-    XFillRectangle(display, window, gc,
-                   0, 0,
-                   (unsigned int)window_width,
-                   (unsigned int)window_height);
+    XFillRectangle(display, window, gc, 0, 0,
+                   (unsigned int)width,
+                   (unsigned int)height);
 
     XSetForeground(display, gc, BlackPixel(display, screen));
 
-    const char *title = "Terminator - Custom Terminal";
+    int visible_rows = (height - TOP_MARGIN - 10) / LINE_HEIGHT;
 
-    XDrawString(display, window, gc,
-                LEFT_MARGIN, TOP_MARGIN,
-                title, (int)strlen(title));
-
-    int output_top = TOP_MARGIN + LINE_HEIGHT;
-    int prompt_width = XTextWidth(
-        font, PROMPT, (int)strlen(PROMPT));
-
-    int max_output_lines =
-        (window_height - output_top - LINE_HEIGHT - 10) / LINE_HEIGHT;
-
-    if (max_output_lines < 0) {
-        max_output_lines = 0;
+    if (visible_rows < 1) {
+        visible_rows = 1;
     }
 
-    int start = buffer->count - max_output_lines;
+    /*
+     * Reserve one row for the active prompt.
+     * While a command is running, history can use all visible rows.
+     */
+    int history_rows = visible_rows;
+
+    if (!command_active) {
+        history_rows = visible_rows - 1;
+
+        if (history_rows < 0) {
+            history_rows = 0;
+        }
+    }
+
+    int start = buffer->count - history_rows;
 
     if (start < 0) {
         start = 0;
     }
 
-    int visible_count = buffer->count - start;
-    int y = output_top;
+    int y = TOP_MARGIN + LINE_HEIGHT;
 
     for (int i = start; i < buffer->count; i++) {
-        if (y + LINE_HEIGHT >= window_height) {
+        if (y > height - 5) {
             break;
         }
 
@@ -366,19 +404,40 @@ static void draw_terminal(
         y += LINE_HEIGHT;
     }
 
-    int prompt_y = output_top + visible_count * LINE_HEIGHT;
+    /*
+     * Place the current prompt immediately after the last history line.
+     * Do not draw a prompt while an external command is still running.
+     */
+    if (!command_active) {
+        if (y > height - 5) {
+            y = height - 5;
+        }
 
-    if (prompt_y + LINE_HEIGHT >= window_height) {
-        prompt_y = window_height - LINE_HEIGHT - 5;
+        XDrawString(display, window, gc,
+                    LEFT_MARGIN, y,
+                    PROMPT, (int)strlen(PROMPT));
+
+        int prompt_width = XTextWidth(
+            font, PROMPT, (int)strlen(PROMPT));
+
+        int input_x = LEFT_MARGIN + prompt_width;
+        int available_width = width - input_x - LEFT_MARGIN;
+
+        if (available_width > 0) {
+            int input_length = (int)strlen(input);
+            int first = 0;
+
+            while (first < input_length &&
+                   XTextWidth(font, input + first,
+                              input_length - first) > available_width) {
+                first++;
+            }
+
+            XDrawString(display, window, gc,
+                        input_x, y,
+                        input + first, input_length - first);
+        }
     }
-
-    XDrawString(display, window, gc,
-                LEFT_MARGIN, prompt_y,
-                PROMPT, (int)strlen(PROMPT));
-
-    XDrawString(display, window, gc,
-                LEFT_MARGIN + prompt_width, prompt_y,
-                input, (int)strlen(input));
 
     XFlush(display);
 }
@@ -389,7 +448,7 @@ int main(void)
 
     if (display == NULL) {
         fprintf(stderr,
-                "Cannot open X display. Check your DISPLAY environment.\n");
+                "Cannot open X display. Check your DISPLAY setting.\n");
         return EXIT_FAILURE;
     }
 
@@ -397,11 +456,9 @@ int main(void)
     Window root = RootWindow(display, screen);
 
     Window window = XCreateSimpleWindow(
-        display, root,
-        100, 100,
+        display, root, 100, 100,
         WINDOW_WIDTH, WINDOW_HEIGHT,
-        1,
-        BlackPixel(display, screen),
+        1, BlackPixel(display, screen),
         WhitePixel(display, screen));
 
     XStoreName(display, window, "Terminator - Custom Terminal");
@@ -441,15 +498,14 @@ int main(void)
         .active = 0,
         .pipe_eof = 0,
         .child_reaped = 0,
-        .partial_line = "",
         .partial_length = 0
     };
 
     char input[INPUT_SIZE] = "";
     size_t input_length = 0;
 
-    int window_width = WINDOW_WIDTH;
-    int window_height = WINDOW_HEIGHT;
+    int width = WINDOW_WIDTH;
+    int height = WINDOW_HEIGHT;
     int running = 1;
 
     XMapWindow(display, window);
@@ -465,17 +521,16 @@ int main(void)
         fds[0].events = POLLIN;
         fds[0].revents = 0;
 
-        if (command_state.active &&
-            command_state.output_fd != -1) {
+        if (command_state.active && command_state.output_fd != -1) {
             fds[1].fd = command_state.output_fd;
             fds[1].events = POLLIN | POLLHUP | POLLERR;
             fds[1].revents = 0;
             nfds = 2;
         }
 
-        int ready = poll(fds, nfds, 50);
+        int result = poll(fds, nfds, 50);
 
-        if (ready == -1 && errno != EINTR) {
+        if (result == -1 && errno != EINTR) {
             fprintf(stderr, "poll() failed: %s\n", strerror(errno));
             break;
         }
@@ -484,8 +539,8 @@ int main(void)
             service_command(&buffer, &command_state);
 
             draw_terminal(display, window, gc, screen,
-                          window_width, window_height,
-                          &buffer, input, font);
+                          width, height, &buffer, input,
+                          command_state.active, font);
         }
 
         while (XPending(display) > 0) {
@@ -495,56 +550,57 @@ int main(void)
             if (event.type == Expose) {
                 if (event.xexpose.count == 0) {
                     draw_terminal(display, window, gc, screen,
-                                  window_width, window_height,
-                                  &buffer, input, font);
+                                  width, height, &buffer, input,
+                                  command_state.active, font);
                 }
             } else if (event.type == ConfigureNotify) {
-                window_width = event.xconfigure.width;
-                window_height = event.xconfigure.height;
+                width = event.xconfigure.width;
+                height = event.xconfigure.height;
 
                 draw_terminal(display, window, gc, screen,
-                              window_width, window_height,
-                              &buffer, input, font);
+                              width, height, &buffer, input,
+                              command_state.active, font);
             } else if (event.type == KeyPress) {
                 char key_text[32];
                 KeySym key_symbol;
 
                 int length = XLookupString(
-                    &event.xkey,
-                    key_text,
+                    &event.xkey, key_text,
                     (int)sizeof(key_text),
-                    &key_symbol,
-                    NULL);
+                    &key_symbol, NULL);
 
                 if (key_symbol == XK_Escape) {
                     running = 0;
                 } else if (key_symbol == XK_BackSpace) {
-                    if (input_length > 0) {
-                        input_length--;
-                        input[input_length] = '\0';
+                    if (input_length > 0 && !command_state.active) {
+                        input[--input_length] = '\0';
                     }
                 } else if (key_symbol == XK_Return ||
                            key_symbol == XK_KP_Enter) {
-                    char submitted[INPUT_SIZE + 32];
-
-                    snprintf(submitted, sizeof(submitted),
-                             "%s%s", PROMPT, input);
-                    add_line(&buffer, submitted);
-
-                    if (input_length == 0) {
-                        add_line(&buffer, "Empty command.");
-                    } else if (command_state.active) {
+                    if (command_state.active) {
+                        /* Do not submit another command while one is running. */
                         add_line(&buffer,
                                  "A command is already running. Please wait.");
                     } else {
-                        (void)start_command(&buffer,
-                                            &command_state,
-                                            input);
-                    }
+                        char submitted[INPUT_SIZE + 32];
 
-                    input_length = 0;
-                    input[0] = '\0';
-                } else {
+                        snprintf(submitted, sizeof(submitted),
+                                 "%s%s", PROMPT, input);
+
+                        /* Record the command before executing it. */
+                        add_line(&buffer, submitted);
+
+                        if (input_length > 0) {
+                            if (!handle_cd(&buffer, input)) {
+                                (void)start_command(
+                                    &buffer, &command_state, input);
+                            }
+                        }
+
+                        input_length = 0;
+                        input[0] = '\0';
+                    }
+                } else if (!command_state.active) {
                     for (int i = 0;
                          i < length && input_length < INPUT_SIZE - 1;
                          i++) {
@@ -558,8 +614,8 @@ int main(void)
                 }
 
                 draw_terminal(display, window, gc, screen,
-                              window_width, window_height,
-                              &buffer, input, font);
+                              width, height, &buffer, input,
+                              command_state.active, font);
             } else if (event.type == ClientMessage) {
                 if ((Atom)event.xclient.data.l[0] == wm_delete) {
                     running = 0;
@@ -568,7 +624,6 @@ int main(void)
         }
     }
 
-    /* Clean up an active child if the window is closed. */
     if (command_state.active) {
         (void)kill(command_state.pid, SIGTERM);
 
