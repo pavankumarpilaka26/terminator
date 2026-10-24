@@ -1,4 +1,3 @@
-
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -10,6 +9,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <signal.h>
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 500
@@ -29,6 +31,16 @@ typedef struct {
     char lines[MAX_LINES][LINE_SIZE];
     int count;
 } TerminalBuffer;
+
+typedef struct {
+    pid_t pid;
+    int output_fd;
+    int active;
+    int pipe_eof;
+    int child_reaped;
+    char partial_line[LINE_SIZE];
+    size_t partial_length;
+} ActiveCommand;
 
 /* Add a line to the terminal buffer. */
 static void add_line(TerminalBuffer *buffer, const char *text)
@@ -73,24 +85,27 @@ static void consume_output(
 }
 
 /*
- * Execute a simple external command.
- *
- * This first parser splits arguments on spaces and tabs.
- * It does not yet support quotes, pipes, or redirection.
+ * Start a simple external command without blocking the X11 event loop.
+ * This parser splits arguments on spaces and tabs only.
+ * Quotes, pipes, redirection, and built-ins are not implemented yet.
  */
-static void execute_command(
+static int start_command(
     TerminalBuffer *buffer,
+    ActiveCommand *state,
     const char *command)
 {
-    char command_copy[INPUT_SIZE];
+    if (state->active) {
+        add_line(buffer,
+                 "A command is already running. Please wait.");
+        return 0;
+    }
 
-    snprintf(command_copy, sizeof(command_copy),
-             "%s", command);
+    char command_copy[INPUT_SIZE];
+    snprintf(command_copy, sizeof(command_copy), "%s", command);
 
     char *argv[MAX_ARGS];
     int argc = 0;
     char *saveptr = NULL;
-
     char *token = strtok_r(command_copy, " \t", &saveptr);
 
     while (token != NULL && argc < MAX_ARGS - 1) {
@@ -102,14 +117,13 @@ static void execute_command(
 
     if (argc == 0) {
         add_line(buffer, "Empty command.");
-        return;
+        return 0;
     }
 
     int pipefd[2];
-
     if (pipe(pipefd) == -1) {
         add_line(buffer, "Error: pipe() failed.");
-        return;
+        return 0;
     }
 
     pid_t pid = fork();
@@ -118,11 +132,11 @@ static void execute_command(
         close(pipefd[0]);
         close(pipefd[1]);
         add_line(buffer, "Error: fork() failed.");
-        return;
+        return 0;
     }
 
     if (pid == 0) {
-        /* Child process: send stdout and stderr into the pipe. */
+        /* Child: redirect stdout and stderr to the pipe. */
         close(pipefd[0]);
 
         if (dup2(pipefd[1], STDOUT_FILENO) == -1 ||
@@ -131,65 +145,114 @@ static void execute_command(
         }
 
         close(pipefd[1]);
-
         execvp(argv[0], argv);
 
-        /* Reached only if execvp() fails. */
         dprintf(STDERR_FILENO,
                 "terminator: %s: command not found or could not execute\n",
                 argv[0]);
-
         _exit(127);
     }
 
-    /* Parent process: read the child's output. */
+    /* Parent: configure the pipe's read end for nonblocking reads. */
     close(pipefd[1]);
 
-    char data[4096];
-    char partial_line[LINE_SIZE] = "";
-    size_t partial_length = 0;
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags == -1 ||
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(pipefd[0]);
+        (void)kill(pid, SIGTERM);
 
-    for (;;) {
-        ssize_t bytes_read = read(pipefd[0], data, sizeof(data));
+        while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {
+        }
 
-        if (bytes_read > 0) {
-            consume_output(
-                buffer,
-                data,
-                (size_t)bytes_read,
-                partial_line,
-                &partial_length);
-        } else if (bytes_read == 0) {
-            /* EOF: the pipe's write end has been closed. */
-            break;
-        } else if (errno == EINTR) {
-            /* A signal interrupted read(); try again. */
-            continue;
-        } else {
-            add_line(buffer, "Error: could not read command output.");
-            break;
+        add_line(buffer,
+                 "Error: could not configure nonblocking output.");
+        return 0;
+    }
+
+    state->pid = pid;
+    state->output_fd = pipefd[0];
+    state->active = 1;
+    state->pipe_eof = 0;
+    state->child_reaped = 0;
+    state->partial_length = 0;
+    state->partial_line[0] = '\0';
+
+    return 1;
+}
+
+/* Read available output and check whether the child has exited. */
+static void service_command(
+    TerminalBuffer *buffer,
+    ActiveCommand *state)
+{
+    if (!state->active) {
+        return;
+    }
+
+    if (!state->pipe_eof && state->output_fd != -1) {
+        char data[4096];
+
+        for (;;) {
+            ssize_t n = read(state->output_fd, data, sizeof(data));
+
+            if (n > 0) {
+                consume_output(buffer, data, (size_t)n,
+                               state->partial_line,
+                               &state->partial_length);
+            } else if (n == 0) {
+                state->pipe_eof = 1;
+                close(state->output_fd);
+                state->output_fd = -1;
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else {
+                add_line(buffer,
+                         "Error: could not read command output.");
+                state->pipe_eof = 1;
+                close(state->output_fd);
+                state->output_fd = -1;
+                break;
+            }
         }
     }
 
-    close(pipefd[0]);
+    if (!state->child_reaped) {
+        int status;
+        pid_t result = waitpid(state->pid, &status, WNOHANG);
 
-    /* Save any output that did not end with a newline. */
-    if (partial_length > 0) {
-        partial_line[partial_length] = '\0';
-        add_line(buffer, partial_line);
-    }
-
-    /* Collect the child's exit status. */
-    int status;
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno != EINTR) {
+        if (result == state->pid) {
+            state->child_reaped = 1;
+        } else if (result == -1 && errno != EINTR) {
             add_line(buffer, "Error: waitpid() failed.");
-            break;
+            state->child_reaped = 1;
         }
+    }
+
+    if (state->pipe_eof && state->child_reaped) {
+        if (state->partial_length > 0) {
+            state->partial_line[state->partial_length] = '\0';
+            add_line(buffer, state->partial_line);
+            state->partial_length = 0;
+            state->partial_line[0] = '\0';
+        }
+
+        state->active = 0;
+        state->pid = -1;
     }
 }
 
-/* Draw the terminal contents and current input. */
+/* Draw the terminal contents and current input.
+ * The title and prompt stay fixed at the top-left.
+ * Command history/output is drawn below them so it cannot cover the prompt.
+ */
+
+/* Draw terminal output followed by the current prompt at the bottom. */
+
+/* Draw terminal output and place the prompt after the latest output. */
 static void draw_terminal(
     Display *display,
     Window window,
@@ -210,32 +273,39 @@ static void draw_terminal(
 
     XSetForeground(display, gc, BlackPixel(display, screen));
 
-    const char *title = "Terminator - Terminal Prototype";
+    /* Draw the title. */
+    const char *title = "Terminator - Custom Terminal";
 
     XDrawString(display, window, gc,
                 LEFT_MARGIN, TOP_MARGIN,
                 title, (int)strlen(title));
 
     int output_top = TOP_MARGIN + LINE_HEIGHT;
+    int prompt_width = XTextWidth(
+        font, PROMPT, (int)strlen(PROMPT));
 
-    int available_height =
-        window_height - output_top - LINE_HEIGHT;
+    /* Reserve space for the prompt at the end of the output. */
+    int max_output_lines =
+        (window_height - output_top - LINE_HEIGHT - 10) / LINE_HEIGHT;
 
-    int visible_lines = available_height / LINE_HEIGHT;
-
-    if (visible_lines < 0) {
-        visible_lines = 0;
+    if (max_output_lines < 0) {
+        max_output_lines = 0;
     }
 
-    int first_line = buffer->count - visible_lines;
-
-    if (first_line < 0) {
-        first_line = 0;
+    int start = buffer->count - max_output_lines;
+    if (start < 0) {
+        start = 0;
     }
 
+    int visible_count = buffer->count - start;
     int y = output_top;
 
-    for (int i = first_line; i < buffer->count; i++) {
+    /* Draw the most recent output lines. */
+    for (int i = start; i < buffer->count; i++) {
+        if (y + LINE_HEIGHT >= window_height) {
+            break;
+        }
+
         XDrawString(display, window, gc,
                     LEFT_MARGIN, y,
                     buffer->lines[i],
@@ -244,174 +314,218 @@ static void draw_terminal(
         y += LINE_HEIGHT;
     }
 
-    int input_y = y + LINE_HEIGHT / 2;
+    /* Prompt immediately follows the last displayed output line. */
+    int prompt_y = output_top + visible_count * LINE_HEIGHT;
 
-    int prompt_width = XTextWidth(
-        font, PROMPT, (int)strlen(PROMPT));
+    if (prompt_y + LINE_HEIGHT >= window_height) {
+        prompt_y = window_height - LINE_HEIGHT - 5;
+    }
 
     XDrawString(display, window, gc,
-                LEFT_MARGIN, input_y,
+                LEFT_MARGIN, prompt_y,
                 PROMPT, (int)strlen(PROMPT));
 
     XDrawString(display, window, gc,
-                LEFT_MARGIN + prompt_width, input_y,
+                LEFT_MARGIN + prompt_width, prompt_y,
                 input, (int)strlen(input));
 
     XFlush(display);
 }
 
+
+
 int main(void)
 {
     Display *display = XOpenDisplay(NULL);
-
     if (display == NULL) {
-        fprintf(stderr, "Cannot open X display\n");
+        fprintf(stderr,
+                "Cannot open X display. Check your DISPLAY environment.\n");
         return EXIT_FAILURE;
     }
 
     int screen = DefaultScreen(display);
+    Window root = RootWindow(display, screen);
 
     Window window = XCreateSimpleWindow(
-        display,
-        RootWindow(display, screen),
+        display, root,
         100, 100,
         WINDOW_WIDTH, WINDOW_HEIGHT,
         1,
         BlackPixel(display, screen),
-        WhitePixel(display, screen)
-    );
+        WhitePixel(display, screen));
 
-    XStoreName(display, window, "Terminator - Terminal Prototype");
+    XStoreName(display, window, "Terminator - Custom Terminal");
 
-    Atom wm_delete = XInternAtom(
-        display, "WM_DELETE_WINDOW", False);
-
+    Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window, &wm_delete, 1);
 
     XSelectInput(display, window,
-                 ExposureMask |
-                 KeyPressMask |
-                 StructureNotifyMask);
+                 ExposureMask | KeyPressMask | StructureNotifyMask);
 
     GC gc = XCreateGC(display, window, 0, NULL);
-
     if (gc == NULL) {
+        fprintf(stderr, "Could not create graphics context.\n");
         XDestroyWindow(display, window);
         XCloseDisplay(display);
         return EXIT_FAILURE;
     }
 
     XFontStruct *font = XLoadQueryFont(display, "fixed");
-
     if (font == NULL) {
-        fprintf(stderr, "Could not load X11 font\n");
-
+        fprintf(stderr, "Could not load X11 font.\n");
         XFreeGC(display, gc);
         XDestroyWindow(display, window);
         XCloseDisplay(display);
-
         return EXIT_FAILURE;
     }
-
     XSetFont(display, gc, font->fid);
 
     TerminalBuffer buffer = {0};
+    ActiveCommand command_state = {
+        .pid = -1,
+        .output_fd = -1,
+        .active = 0,
+        .pipe_eof = 0,
+        .child_reaped = 0,
+        .partial_line = "",
+        .partial_length = 0
+    };
 
     char input[INPUT_SIZE] = "";
     size_t input_length = 0;
-
     int window_width = WINDOW_WIDTH;
     int window_height = WINDOW_HEIGHT;
     int running = 1;
 
     XMapWindow(display, window);
+    XFlush(display);
+
+    int x_fd = ConnectionNumber(display);
 
     while (running) {
-        XEvent event;
-        XNextEvent(display, &event);
+        struct pollfd fds[2];
+        nfds_t nfds = 1;
 
-        if (event.type == Expose) {
-            if (event.xexpose.count == 0) {
-                draw_terminal(
-                    display, window, gc, screen,
-                    window_width, window_height,
-                    &buffer, input, font);
-            }
+        fds[0].fd = x_fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+
+        if (command_state.active && command_state.output_fd != -1) {
+            fds[1].fd = command_state.output_fd;
+            fds[1].events = POLLIN | POLLHUP | POLLERR;
+            fds[1].revents = 0;
+            nfds = 2;
         }
-        else if (event.type == ConfigureNotify) {
-            window_width = event.xconfigure.width;
-            window_height = event.xconfigure.height;
 
-            draw_terminal(
-                display, window, gc, screen,
-                window_width, window_height,
-                &buffer, input, font);
+        /* Timeout lets us periodically check child exit status. */
+        int ready = poll(fds, nfds, 50);
+        if (ready == -1 && errno != EINTR) {
+            fprintf(stderr, "poll() failed: %s\n", strerror(errno));
+            break;
         }
-        else if (event.type == KeyPress) {
-            char key_text[32];
-            KeySym key_symbol;
 
-            int length = XLookupString(
-                &event.xkey,
-                key_text,
-                sizeof(key_text),
-                &key_symbol,
-                NULL
-            );
+        if (command_state.active) {
+            service_command(&buffer, &command_state);
+            draw_terminal(display, window, gc, screen,
+                          window_width, window_height,
+                          &buffer, input, font);
+        }
 
-            if (key_symbol == XK_Escape) {
-                running = 0;
-            }
-            else if (key_symbol == XK_BackSpace) {
-                if (input_length > 0) {
-                    input_length--;
-                    input[input_length] = '\0';
+        /*
+         * Xlib may already have events buffered internally even when the
+         * underlying connection descriptor is no longer readable.
+         */
+        while (XPending(display) > 0) {
+            XEvent event;
+            XNextEvent(display, &event);
+
+            if (event.type == Expose) {
+                if (event.xexpose.count == 0) {
+                    draw_terminal(display, window, gc, screen,
+                                  window_width, window_height,
+                                  &buffer, input, font);
                 }
-            }
-            else if (key_symbol == XK_Return ||
-                     key_symbol == XK_KP_Enter) {
+            } else if (event.type == ConfigureNotify) {
+                window_width = event.xconfigure.width;
+                window_height = event.xconfigure.height;
 
-                char submitted[INPUT_SIZE + 32];
+                draw_terminal(display, window, gc, screen,
+                              window_width, window_height,
+                              &buffer, input, font);
+            } else if (event.type == KeyPress) {
+                char key_text[32];
+                KeySym key_symbol;
 
-                snprintf(submitted, sizeof(submitted),
-                         "%s%s", PROMPT, input);
+                int length = XLookupString(
+                    &event.xkey,
+                    key_text,
+                    (int)sizeof(key_text),
+                    &key_symbol,
+                    NULL);
 
-                add_line(&buffer, submitted);
-
-                if (input_length == 0) {
-                    add_line(&buffer, "Empty command.");
-                } else {
-                    execute_command(&buffer, input);
-                }
-
-                input_length = 0;
-                input[0] = '\0';
-            }
-            else {
-                for (int i = 0;
-                     i < length &&
-                     input_length < INPUT_SIZE - 1;
-                     i++) {
-
-                    unsigned char ch =
-                        (unsigned char)key_text[i];
-
-                    if (ch >= 32 && ch <= 126) {
-                        input[input_length++] = (char)ch;
+                if (key_symbol == XK_Escape) {
+                    running = 0;
+                } else if (key_symbol == XK_BackSpace) {
+                    if (input_length > 0) {
+                        input_length--;
                         input[input_length] = '\0';
                     }
+                } else if (key_symbol == XK_Return ||
+                           key_symbol == XK_KP_Enter) {
+                    char submitted[INPUT_SIZE + 32];
+
+                    snprintf(submitted, sizeof(submitted),
+                             "%s%s", PROMPT, input);
+                    add_line(&buffer, submitted);
+
+                    if (input_length == 0) {
+                        add_line(&buffer, "Empty command.");
+                    } else if (command_state.active) {
+                        add_line(&buffer,
+                                 "A command is already running. Please wait.");
+                    } else {
+                        (void)start_command(&buffer,
+                                            &command_state,
+                                            input);
+                    }
+
+                    input_length = 0;
+                    input[0] = '\0';
+                } else {
+                    for (int i = 0;
+                         i < length && input_length < INPUT_SIZE - 1;
+                         i++) {
+                        unsigned char ch = (unsigned char)key_text[i];
+
+                        if (ch >= 32 && ch <= 126) {
+                            input[input_length++] = (char)ch;
+                            input[input_length] = '\0';
+                        }
+                    }
+                }
+
+                draw_terminal(display, window, gc, screen,
+                              window_width, window_height,
+                              &buffer, input, font);
+            } else if (event.type == ClientMessage) {
+                if ((Atom)event.xclient.data.l[0] == wm_delete) {
+                    running = 0;
                 }
             }
-
-            draw_terminal(
-                display, window, gc, screen,
-                window_width, window_height,
-                &buffer, input, font);
         }
-        else if (event.type == ClientMessage) {
-            if ((Atom)event.xclient.data.l[0] == wm_delete) {
-                running = 0;
-            }
+    }
+
+    /* Clean up a running child when the GUI closes. */
+    if (command_state.active) {
+        (void)kill(command_state.pid, SIGTERM);
+
+        if (command_state.output_fd != -1) {
+            close(command_state.output_fd);
+            command_state.output_fd = -1;
+        }
+
+        while (waitpid(command_state.pid, NULL, 0) == -1 &&
+               errno == EINTR) {
         }
     }
 
