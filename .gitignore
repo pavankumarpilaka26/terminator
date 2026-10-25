@@ -1,3 +1,15 @@
 terminator
 *.o
 window_test
+
+# Compiled executable
+/terminator_multiwatch
+
+# Windows download metadata
+*:Zone.Identifier
+
+# Temporary test outputs
+/pavan.txt
+/sorted.txt
+/test.txt
+/text.txt
