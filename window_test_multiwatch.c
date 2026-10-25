@@ -44,6 +44,8 @@ typedef struct {
     int active;
     int pipe_eof;
     int child_reaped;
+    int stopped;
+    int background;
     int exit_status;
     char partial_line[LINE_SIZE];
     size_t partial_length;
@@ -109,6 +111,7 @@ static int window_height = WINDOW_HEIGHT;
 static CommandHistory command_history;
 
 static void stop_multiwatch(TerminalTab *tab);
+static void service_tab(TerminalTab *tab);
 
 /* ---------- Terminal display buffer ---------- */
 
@@ -793,6 +796,8 @@ static void start_pipeline(TerminalTab *tab, const char *original,
     tab->command.active = 1;
     tab->command.pipe_eof = 0;
     tab->command.child_reaped = 0;
+    tab->command.stopped = 0;
+    tab->command.background = 0;
     tab->command.partial_length = 0;
     tab->command.partial_line[0] = '\0';
     tab->command.exit_status = 0;
@@ -1193,6 +1198,8 @@ static void start_bash_command(TerminalTab *tab, const char *original,
     tab->command.active = 1;
     tab->command.pipe_eof = 0;
     tab->command.child_reaped = 0;
+    tab->command.stopped = 0;
+    tab->command.background = 0;
     tab->command.partial_length = 0;
     tab->command.partial_line[0] = '\0';
     tab->command.exit_status = 0;
@@ -1200,13 +1207,131 @@ static void start_bash_command(TerminalTab *tab, const char *original,
              "%s", original);
 }
 
-static void start_command(TerminalTab *tab, const char *original_command)
+
+/*
+ * Run an additional command while another job is in the background.
+ * Keep the background job's ActiveCommand state intact. This helper is
+ * synchronous (the X11 UI pauses until this short command finishes).
+ */
+static void run_while_background(TerminalTab *tab, const char *command)
 {
-    if (tab->command.active) {
-        add_line(&tab->buffer,
-                 "A command is already running in this tab.");
+    int pfd[2];
+    if (pipe(pfd) == -1) {
+        add_format(&tab->buffer, "pipe: %s", strerror(errno));
         tab->last_status = 1;
         return;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pfd[0]);
+        close(pfd[1]);
+        add_format(&tab->buffer, "fork: %s", strerror(errno));
+        tab->last_status = 1;
+        return;
+    }
+
+    if (pid == 0) {
+        close(pfd[0]);
+        (void)setpgid(0, 0);
+        if (dup2(pfd[1], STDOUT_FILENO) == -1 ||
+            dup2(pfd[1], STDERR_FILENO) == -1)
+            _exit(126);
+        close(pfd[1]);
+        if (chdir(tab->cwd) == -1) {
+            dprintf(STDERR_FILENO, "chdir: %s\n", strerror(errno));
+            _exit(126);
+        }
+        execl("/bin/bash", "bash", "--noprofile", "--norc", "-c",
+              command, (char *)NULL);
+        dprintf(STDERR_FILENO, "terminator: cannot start bash: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+
+    close(pfd[1]);
+    char data[2048];
+    char line[LINE_SIZE];
+    size_t used = 0;
+    int status = 0;
+
+    for (;;) {
+        ssize_t n = read(pfd[0], data, sizeof(data));
+        if (n > 0) {
+            for (ssize_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)data[i];
+                if (c == '\r')
+                    continue;
+                if (c == '\n') {
+                    line[used] = '\0';
+                    add_line(&tab->buffer, line);
+                    used = 0;
+                } else if (c >= 32 || c == '\t') {
+                    if (used < sizeof(line) - 1)
+                        line[used++] = c == '\t' ? ' ' : (char)c;
+                }
+            }
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            add_format(&tab->buffer, "read: %s", strerror(errno));
+            break;
+        }
+    }
+    close(pfd[0]);
+    if (used > 0) {
+        line[used] = '\0';
+        add_line(&tab->buffer, line);
+    }
+
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno == EINTR)
+            continue;
+        status = 1 << 8;
+        break;
+    }
+    if (WIFEXITED(status))
+        tab->last_status = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+        tab->last_status = 128 + WTERMSIG(status);
+    else
+        tab->last_status = 1;
+}
+
+static int is_persistent_builtin_name(const char *command)
+{
+    while (*command == ' ' || *command == '\t')
+        ++command;
+    char name[32];
+    size_t n = 0;
+    while (command[n] && command[n] != ' ' && command[n] != '\t' &&
+           command[n] != '\n' && n + 1 < sizeof(name)) {
+        name[n] = command[n];
+        ++n;
+    }
+    name[n] = '\0';
+    return strcmp(name, "cd") == 0 || strcmp(name, "history") == 0 ||
+           strcmp(name, "exit") == 0 || strcmp(name, "source") == 0 ||
+           strcmp(name, ".") == 0 || strcmp(name, "jobs") == 0 ||
+           strcmp(name, "fg") == 0 || strcmp(name, "bg") == 0;
+}
+
+static void start_command(TerminalTab *tab, const char *original_command)
+{
+    if (tab->command.active && !tab->command.stopped) {
+        if (!tab->command.background) {
+            add_line(&tab->buffer,
+                     "A foreground command is already running in this tab.");
+            tab->last_status = 1;
+            return;
+        }
+
+        /* Do not overwrite the background job's PID/pipe state. */
+        if (!is_persistent_builtin_name(original_command)) {
+            record_command_line(tab, original_command);
+            run_while_background(tab, original_command);
+            return;
+        }
     }
 
     if (strncmp(original_command, "multiWatch", 10) == 0 &&
@@ -1314,51 +1439,149 @@ static void start_command(TerminalTab *tab, const char *original_command)
         return;
     }
 
-    /*
-     * Task 2 job-control foundation.
-     * Commands already run asynchronously in their own process group.
-     */
+    /* Job-control commands operate on the current tab's active process group.
+       Commands remain asynchronously serviced so the X11 event loop stays live. */
     if (strcmp(argv[0], "jobs") == 0) {
-        int found = 0;
-
-        for (int i = 0; i < tab_count; i++) {
-            if (tabs[i].command.active) {
-                char message[LINE_SIZE];
-                snprintf(message, sizeof(message),
-                         "[%d] running: %.1000s",
-                         i + 1, tabs[i].command.command_text);
-                add_line(&tab->buffer, message);
-                found = 1;
-            }
+        if (!tab->command.active) {
+            add_line(&tab->buffer, "No running or stopped jobs in this tab.");
+        } else {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "[1] %s: %.900s",
+                     tab->command.stopped ? "stopped" :
+                     (tab->command.background ? "running (background)" : "running"),
+                     tab->command.command_text);
+            add_line(&tab->buffer, message);
         }
-
-        if (!found)
-            add_line(&tab->buffer, "No running commands.");
-
         tab->last_status = 0;
         return;
     }
 
-    if (strcmp(argv[0], "fg") == 0) {
-        add_line(&tab->buffer,
-                 "fg: commands are monitored asynchronously per tab; "
-                 "interactive foreground job control is not implemented yet.");
-        tab->last_status = 1;
-        return;
-    }
-
-    if (strcmp(argv[0], "bg") == 0) {
-        add_line(&tab->buffer,
-                 "bg: commands already run asynchronously; "
-                 "job suspension/resumption is not implemented yet.");
-        tab->last_status = 1;
+    if (strcmp(argv[0], "fg") == 0 || strcmp(argv[0], "bg") == 0) {
+        int make_background = strcmp(argv[0], "bg") == 0;
+        if (argc > 2 || (argc == 2 && strcmp(argv[1], "%1") != 0 &&
+                          strcmp(argv[1], "1") != 0)) {
+            add_line(&tab->buffer, make_background ? "bg: usage: bg [%1]" :
+                                                    "fg: usage: fg [%1]");
+            tab->last_status = 2;
+            return;
+        }
+        if (!tab->command.active || tab->command.pid <= 0) {
+            add_line(&tab->buffer, make_background ? "bg: no current job" :
+                                                    "fg: no current job");
+            tab->last_status = 1;
+            return;
+        }
+        if (tab->command.stopped) {
+            if (kill(-tab->command.pid, SIGCONT) == -1 &&
+                kill(tab->command.pid, SIGCONT) == -1) {
+                add_format(&tab->buffer, make_background ? "bg: %s" : "fg: %s",
+                           strerror(errno));
+                tab->last_status = 1;
+                return;
+            }
+            tab->command.stopped = 0;
+        }
+        tab->command.background = make_background;
+        add_line(&tab->buffer, make_background ?
+                 "[1] continued in background; output will appear in this tab." :
+                 "[1] continued in foreground; output will appear in this tab.");
+        tab->last_status = 0;
         return;
     }
 
     if (strcmp(argv[0], "source") == 0 || strcmp(argv[0], ".") == 0) {
-        add_line(&tab->buffer,
-                 "source: script interpreter is not implemented in this version.");
-        tab->last_status = 1;
+        if (argc != 2) {
+            add_line(&tab->buffer, "source: usage: source filename");
+            tab->last_status = 2;
+            return;
+        }
+        char script_path[PATH_MAX];
+        const char *requested_path = argv[1];
+        if (requested_path[0] == '/') {
+            if (snprintf(script_path, sizeof(script_path), "%s",
+                         requested_path) >= (int)sizeof(script_path)) {
+                add_line(&tab->buffer, "source: script path is too long");
+                tab->last_status = 1;
+                return;
+            }
+        } else if (requested_path[0] == '~' &&
+                   (requested_path[1] == '/' || requested_path[1] == '\0')) {
+            const char *home = getenv("HOME");
+            if (home == NULL) home = "/";
+            if (snprintf(script_path, sizeof(script_path), "%s%s",
+                         home, requested_path + 1) >= (int)sizeof(script_path)) {
+                add_line(&tab->buffer, "source: script path is too long");
+                tab->last_status = 1;
+                return;
+            }
+        } else if (snprintf(script_path, sizeof(script_path), "%s/%s",
+                            tab->cwd, requested_path) >= (int)sizeof(script_path)) {
+            add_line(&tab->buffer, "source: script path is too long");
+            tab->last_status = 1;
+            return;
+        }
+        FILE *script = fopen(script_path, "r");
+        if (script == NULL) {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "source: %s: %s",
+                     requested_path, strerror(errno));
+            add_line(&tab->buffer, message);
+            tab->last_status = 1;
+            return;
+        }
+        char script_line[INPUT_SIZE];
+        unsigned long line_number = 0;
+        int script_failed = 0;
+        while (fgets(script_line, sizeof(script_line), script) != NULL) {
+            ++line_number;
+            size_t n = strlen(script_line);
+            if (n > 0 && script_line[n - 1] == '\n')
+                script_line[--n] = '\0';
+            else if (!feof(script)) {
+                char message[LINE_SIZE];
+                snprintf(message, sizeof(message),
+                         "source: %s:%lu: line too long", argv[1], line_number);
+                add_line(&tab->buffer, message);
+                script_failed = 1;
+                int ch;
+                while ((ch = fgetc(script)) != '\n' && ch != EOF) {}
+                continue;
+            }
+            char *line = script_line;
+            while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
+            if (*line == '\0' || *line == '#') continue;
+            /* Strip trailing CR for Windows-created script files. */
+            n = strlen(line);
+            while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
+                             line[n - 1] == '\r')) line[--n] = '\0';
+            if (*line == '\0') continue;
+            if (strcmp(line, "exit") == 0) break;
+            start_command(tab, line);
+            /* The existing command engine is asynchronous; wait for each script
+               command to finish before interpreting the next line. */
+            while (tab->command.active && !tab->command.stopped) {
+                service_tab(tab);
+                if (tab->command.active) {
+                    struct timespec pause_time = {0, 10000000L};
+                    (void)nanosleep(&pause_time, NULL);
+                }
+            }
+            if (tab->command.stopped) {
+                add_line(&tab->buffer, "source: command stopped; script paused.");
+                script_failed = 1;
+                break;
+            }
+            if (tab->last_status != 0)
+                script_failed = 1;
+        }
+        if (ferror(script)) {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "source: error reading %s", argv[1]);
+            add_line(&tab->buffer, message);
+            script_failed = 1;
+        }
+        fclose(script);
+        tab->last_status = script_failed ? 1 : 0;
         return;
     }
 
@@ -1441,6 +1664,8 @@ static void start_command(TerminalTab *tab, const char *original_command)
     tab->command.active = 1;
     tab->command.pipe_eof = 0;
     tab->command.child_reaped = 0;
+    tab->command.stopped = 0;
+    tab->command.background = 0;
     tab->command.partial_length = 0;
     tab->command.partial_line[0] = '\0';
     tab->command.exit_status = 0;
@@ -1485,17 +1710,24 @@ static void service_tab(TerminalTab *tab)
 
     if (!cmd->child_reaped) {
         int status = 0;
-        pid_t result = waitpid(cmd->pid, &status, WNOHANG);
+        pid_t result = waitpid(cmd->pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
 
         if (result == cmd->pid) {
-            cmd->child_reaped = 1;
-
-            if (WIFEXITED(status))
-                cmd->exit_status = WEXITSTATUS(status);
-            else if (WIFSIGNALED(status))
-                cmd->exit_status = 128 + WTERMSIG(status);
-            else
-                cmd->exit_status = 1;
+            if (WIFSTOPPED(status)) {
+                cmd->stopped = 1;
+                cmd->background = 0;
+                add_line(&tab->buffer, "[1] stopped (Ctrl+Z); use fg or bg to continue.");
+            } else if (WIFCONTINUED(status)) {
+                cmd->stopped = 0;
+            } else {
+                cmd->child_reaped = 1;
+                if (WIFEXITED(status))
+                    cmd->exit_status = WEXITSTATUS(status);
+                else if (WIFSIGNALED(status))
+                    cmd->exit_status = 128 + WTERMSIG(status);
+                else
+                    cmd->exit_status = 1;
+            }
         } else if (result == -1 && errno != EINTR) {
             cmd->child_reaped = 1;
             cmd->exit_status = 1;
@@ -1538,7 +1770,8 @@ static void draw_window(void)
         snprintf(label, sizeof(label), "[%c %d: %.60s%s]",
                  i == active_tab ? '*' : ' ',
                  i + 1, base,
-                 (tabs[i].command.active || tabs[i].watch.active) ? " (running)" : "");
+                 (tabs[i].command.active || tabs[i].watch.active) ?
+                     (tabs[i].command.stopped ? " (stopped)" : " (running)") : "");
 
         XDrawString(display, window, gc, x, 19,
                     label, (int)strlen(label));
@@ -1584,7 +1817,8 @@ static void draw_window(void)
                     (int)strlen(tab->buffer.lines[i]));
     }
 
-    if (!tab->command.active && !tab->watch.active) {
+    if ((!tab->command.active || tab->command.stopped ||
+         tab->command.background) && !tab->watch.active) {
         if (y > window_height - 5)
             y = window_height - 5;
 
@@ -1708,12 +1942,28 @@ static void handle_key(XKeyEvent *event)
     }
 
     if (ctrl && (key == XK_c || key == XK_C)) {
-        if (tab->watch.active)
+        if (tab->watch.active) {
             stop_multiwatch(tab);
+        } else if (tab->command.active && tab->command.pid > 0) {
+            (void)kill(-tab->command.pid, SIGINT);
+            (void)kill(tab->command.pid, SIGINT);
+        }
         return;
     }
 
-    if (tab->command.active || tab->watch.active)
+    if (ctrl && (key == XK_z || key == XK_Z)) {
+        if (tab->command.active && tab->command.pid > 0 &&
+            !tab->command.stopped) {
+            if (kill(-tab->command.pid, SIGTSTP) == -1)
+                (void)kill(tab->command.pid, SIGTSTP);
+            add_line(&tab->buffer, "Sent Ctrl+Z (SIGTSTP) to current job.");
+        }
+        return;
+    }
+
+    /* A background job must not block keyboard input; foreground jobs do. */
+    if ((tab->command.active && !tab->command.stopped &&
+         !tab->command.background) || tab->watch.active)
         return;
 
     if (key == XK_BackSpace) {
