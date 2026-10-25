@@ -73,6 +73,12 @@ typedef struct {
     TerminalBuffer buffer;
     char input[INPUT_SIZE];
     size_t input_length;
+    /* Accumulates multiline commands while quotes/substitutions continue. */
+    char pending_command[INPUT_SIZE];
+    size_t pending_length;
+    int continuation_mode;
+    int suppress_next_echo;
+    int previous_backslash_continuation;
     char cwd[PATH_MAX];
     ActiveCommand command;
     MultiWatch watch;
@@ -183,6 +189,18 @@ static void history_add(const char *command)
 
     if (command_history.count < MAX_HISTORY)
         command_history.count++;
+}
+
+static void record_command_line(TerminalTab *tab, const char *command)
+{
+    if (tab->suppress_next_echo) {
+        tab->suppress_next_echo = 0;
+    } else {
+        char submitted[LINE_SIZE];
+        snprintf(submitted, sizeof(submitted), "%s%.1000s", PROMPT, command);
+        add_line(&tab->buffer, submitted);
+    }
+    history_add(command);
 }
 
 static void show_history(TerminalTab *tab)
@@ -738,10 +756,7 @@ static void run_pipeline_child(const char *cwd, const char *command)
 static void start_pipeline(TerminalTab *tab, const char *original,
                            const char *expanded)
 {
-    char submitted[LINE_SIZE];
-    snprintf(submitted, sizeof(submitted), "%s%s", PROMPT, original);
-    add_line(&tab->buffer, submitted);
-    history_add(original);
+    record_command_line(tab, original);
 
     int output_pipe[2];
     if (pipe(output_pipe) == -1) {
@@ -992,6 +1007,7 @@ static int parse_multiwatch_list(const char *input, MultiWatch *mw)
 
 static void start_multiwatch(TerminalTab *tab, const char *original)
 {
+    record_command_line(tab, original);
     MultiWatch parsed;
     int parsed_result = parse_multiwatch_list(original, &parsed);
     if (parsed_result < 0) {
@@ -1005,10 +1021,6 @@ static void start_multiwatch(TerminalTab *tab, const char *original)
         tab->last_status = 1;
         return;
     }
-    char submitted[LINE_SIZE];
-    snprintf(submitted, sizeof(submitted), "%s%s", PROMPT, original);
-    add_line(&tab->buffer, submitted);
-    history_add(original);
     tab->watch = parsed;
     tab->watch.active = 1;
     add_line(&tab->buffer, "multiWatch started. Press Ctrl+C to stop watched commands.");
@@ -1081,6 +1093,113 @@ static void service_multiwatch(TerminalTab *tab)
 
 /* ---------- External command execution ---------- */
 
+static int command_needs_bash(const char *s);
+static void start_bash_command(TerminalTab *tab, const char *original,
+                               const char *command);
+
+/* Returns true while a quote, backtick, or $(...) remains unfinished. */
+static int command_is_incomplete(const char *s)
+{
+    char quote = '\0';
+    int backtick = 0, depth = 0, escaped = 0;
+    for (size_t i = 0; s[i]; ++i) {
+        char c = s[i];
+        if (escaped) { escaped = 0; continue; }
+        if (c == '\\' && quote != '\'') { escaped = 1; continue; }
+        if (backtick) { if (c == '`') backtick = 0; continue; }
+        if (quote == '\'') { if (c == '\'') quote = '\0'; continue; }
+        if (c == '`') { backtick = 1; continue; }
+        if (c == '"' && (quote == '\0' || quote == '"')) {
+            quote = quote == '"' ? '\0' : '"';
+            continue;
+        }
+        if (c == '\'' && quote == '\0') { quote = '\''; continue; }
+        if (c == '$' && s[i + 1] == '(') { ++depth; ++i; continue; }
+        if (depth > 0 && c == '(') ++depth;
+        else if (depth > 0 && c == ')') --depth;
+    }
+    return quote != '\0' || backtick || depth > 0 || escaped;
+}
+
+/* Respect single quotes when deciding whether Bash expansion is required. */
+static int command_needs_bash(const char *s)
+{
+    char quote = '\0';
+    int escaped = 0;
+    for (size_t i = 0; s[i]; ++i) {
+        char c = s[i];
+        if (escaped) { escaped = 0; continue; }
+        if (c == '\\' && quote != '\'') { escaped = 1; continue; }
+        if (quote == '\'') { if (c == '\'') quote = '\0'; continue; }
+        if (c == '\'' && quote == '\0') { quote = '\''; continue; }
+        if (c == '"' && (quote == '\0' || quote == '"')) {
+            quote = quote == '"' ? '\0' : '"';
+            continue;
+        }
+        if (c == '`' || (c == '$' &&
+            (s[i + 1] == '(' || s[i + 1] == '{' ||
+             (s[i + 1] >= 'A' && s[i + 1] <= 'Z') ||
+             (s[i + 1] >= 'a' && s[i + 1] <= 'z') || s[i + 1] == '_')))
+            return 1;
+    }
+    return 0;
+}
+
+static void start_bash_command(TerminalTab *tab, const char *original,
+                               const char *command)
+{
+    record_command_line(tab, original);
+    int pfd[2];
+    if (pipe(pfd) == -1) {
+        add_format(&tab->buffer, "pipe: %s", strerror(errno));
+        tab->last_status = 1;
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pfd[0]); close(pfd[1]);
+        add_format(&tab->buffer, "fork: %s", strerror(errno));
+        tab->last_status = 1;
+        return;
+    }
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        close(pfd[0]);
+        if (dup2(pfd[1], STDOUT_FILENO) == -1 ||
+            dup2(pfd[1], STDERR_FILENO) == -1) _exit(126);
+        close(pfd[1]);
+        if (chdir(tab->cwd) == -1) {
+            dprintf(STDERR_FILENO, "chdir: %s\n", strerror(errno));
+            _exit(126);
+        }
+        execl("/bin/bash", "bash", "--noprofile", "--norc", "-c",
+              command, (char *)NULL);
+        dprintf(STDERR_FILENO, "terminator: cannot start bash: %s\n",
+                strerror(errno));
+        _exit(127);
+    }
+    (void)setpgid(pid, pid);
+    close(pfd[1]);
+    int flags = fcntl(pfd[0], F_GETFL, 0);
+    if (flags == -1 || fcntl(pfd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(pfd[0]); (void)kill(-pid, SIGTERM);
+        while (waitpid(pid, NULL, 0) == -1 && errno == EINTR) {}
+        add_line(&tab->buffer, "Error configuring command output pipe");
+        tab->last_status = 1;
+        return;
+    }
+    tab->command.pid = pid;
+    tab->command.output_fd = pfd[0];
+    tab->command.active = 1;
+    tab->command.pipe_eof = 0;
+    tab->command.child_reaped = 0;
+    tab->command.partial_length = 0;
+    tab->command.partial_line[0] = '\0';
+    tab->command.exit_status = 0;
+    snprintf(tab->command.command_text, sizeof(tab->command.command_text),
+             "%s", original);
+}
+
 static void start_command(TerminalTab *tab, const char *original_command)
 {
     if (tab->command.active) {
@@ -1100,6 +1219,11 @@ static void start_command(TerminalTab *tab, const char *original_command)
     char expanded[INPUT_SIZE];
     expand_status(expanded, sizeof(expanded),
                   original_command, tab->last_status);
+
+    if (command_needs_bash(expanded)) {
+        start_bash_command(tab, original_command, expanded);
+        return;
+    }
 
     if (has_pipeline(expanded)) {
         start_pipeline(tab, original_command, expanded);
@@ -1160,13 +1284,7 @@ static void start_command(TerminalTab *tab, const char *original_command)
         tab->last_status = 2; return;
     }
 
-    char submitted[LINE_SIZE];
-    snprintf(submitted, sizeof(submitted), "%s%s",
-             PROMPT, original_command);
-    add_line(&tab->buffer, submitted);
-
-    /* Store commands in the global in-process history ring. */
-    history_add(original_command);
+    record_command_line(tab, original_command);
 
     /* Built-in: cd */
     if (strcmp(argv[0], "cd") == 0) {
@@ -1470,11 +1588,12 @@ static void draw_window(void)
         if (y > window_height - 5)
             y = window_height - 5;
 
+        const char *visible_prompt = tab->continuation_mode ? "> " : PROMPT;
         XDrawString(display, window, gc, LEFT_MARGIN, y,
-                    PROMPT, (int)strlen(PROMPT));
+                    visible_prompt, (int)strlen(visible_prompt));
 
         int prompt_width =
-            XTextWidth(font, PROMPT, (int)strlen(PROMPT));
+            XTextWidth(font, visible_prompt, (int)strlen(visible_prompt));
 
         int input_x = LEFT_MARGIN + prompt_width;
         int available_width = window_width - input_x - LEFT_MARGIN;
@@ -1606,13 +1725,62 @@ static void handle_key(XKeyEvent *event)
     if (key == XK_Return || key == XK_KP_Enter) {
         tab->input[tab->input_length] = '\0';
 
-        char command[INPUT_SIZE];
-        snprintf(command, sizeof(command), "%s", tab->input);
+        char visible_line[LINE_SIZE];
+        const char *line_prompt = tab->continuation_mode ? "> " : PROMPT;
+        snprintf(visible_line, sizeof(visible_line), "%s%.1000s",
+                 line_prompt, tab->input);
+        add_line(&tab->buffer, visible_line);
+        tab->scroll_offset = 0;
+
+        size_t line_length = tab->input_length;
+        size_t trailing_slashes = 0;
+        for (size_t i = line_length; i > 0 &&
+             tab->input[i - 1] == '\\'; --i)
+            ++trailing_slashes;
+        int backslash_continuation = (trailing_slashes % 2) == 1;
+        if (backslash_continuation && line_length > 0)
+            --line_length;
+
+        size_t separator = (tab->pending_length > 0 &&
+                            !tab->previous_backslash_continuation) ? 1 : 0;
+        if (tab->pending_length + separator + line_length >=
+            sizeof(tab->pending_command)) {
+            add_line(&tab->buffer, "terminator: multiline command is too long");
+            tab->pending_length = 0;
+            tab->pending_command[0] = '\0';
+            tab->continuation_mode = 0;
+            tab->previous_backslash_continuation = 0;
+            tab->input_length = 0;
+            tab->input[0] = '\0';
+            return;
+        }
+
+        if (separator)
+            tab->pending_command[tab->pending_length++] = '\n';
+        if (line_length > 0) {
+            memcpy(tab->pending_command + tab->pending_length,
+                   tab->input, line_length);
+            tab->pending_length += line_length;
+        }
+        tab->pending_command[tab->pending_length] = '\0';
 
         tab->input_length = 0;
         tab->input[0] = '\0';
-        tab->scroll_offset = 0;
 
+        if (backslash_continuation ||
+            command_is_incomplete(tab->pending_command)) {
+            tab->continuation_mode = 1;
+            tab->previous_backslash_continuation = backslash_continuation;
+            return;
+        }
+
+        char command[INPUT_SIZE];
+        snprintf(command, sizeof(command), "%s", tab->pending_command);
+        tab->pending_length = 0;
+        tab->pending_command[0] = '\0';
+        tab->continuation_mode = 0;
+        tab->previous_backslash_continuation = 0;
+        tab->suppress_next_echo = 1;
         start_command(tab, command);
         return;
     }
