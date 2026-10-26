@@ -1331,13 +1331,54 @@ static void start_bash_command(TerminalTab *tab, const char *original,
              "%s", original);
 }
 
+/* Detect a trailing unquoted '&' and remove it from the command text. */
+static int extract_background_operator(char *command)
+{
+    size_t n = strlen(command);
+    while (n > 0 && (command[n - 1] == ' ' || command[n - 1] == '\t'))
+        command[--n] = '\0';
+    if (n == 0 || command[n - 1] != '&')
+        return 0;
+
+    /* Do not treat a quoted or escaped ampersand as a job operator. */
+    char quote = '\0';
+    int escaped = 0;
+    for (size_t i = 0; i < n - 1; ++i) {
+        char c = command[i];
+        if (escaped) { escaped = 0; continue; }
+        if (c == '\\' && quote != '\'') { escaped = 1; continue; }
+        if ((c == '\'' || c == '"') && (quote == '\0' || quote == c)) {
+            quote = quote == '\0' ? c : '\0';
+            continue;
+        }
+    }
+    if (quote != '\0' || escaped)
+        return 0;
+
+    /* A preceding '&' is not supported as a separate shell operator. */
+    command[n - 1] = '\0';
+    while (n > 1 && (command[n - 2] == ' ' || command[n - 2] == '\t'))
+        command[--n - 1] = '\0';
+    return 1;
+}
+
 static void start_command(TerminalTab *tab, const char *original_command)
 {
     if (tab->command.active && !tab->command.stopped) {
-        add_line(&tab->buffer,
-                 "A command is already running in this tab.");
-        tab->last_status = 1;
-        return;
+        int is_job_builtin =
+            strcmp(original_command, "jobs") == 0 ||
+            strcmp(original_command, "bg") == 0 ||
+            strcmp(original_command, "bg %1") == 0 ||
+            strcmp(original_command, "bg 1") == 0 ||
+            strcmp(original_command, "fg") == 0 ||
+            strcmp(original_command, "fg %1") == 0 ||
+            strcmp(original_command, "fg 1") == 0;
+        if (!tab->command.background || !is_job_builtin) {
+            add_line(&tab->buffer,
+                     "A command is already running. Use jobs, fg, or bg.");
+            tab->last_status = 1;
+            return;
+        }
     }
 
     if (strncmp(original_command, "multiWatch", 10) == 0 &&
@@ -1350,14 +1391,36 @@ static void start_command(TerminalTab *tab, const char *original_command)
     char expanded[INPUT_SIZE];
     expand_status(expanded, sizeof(expanded),
                   original_command, tab->last_status);
+    int run_in_background = extract_background_operator(expanded);
+    if (expanded[0] == '\0') {
+        add_line(&tab->buffer, "Syntax error: '&' requires a command.");
+        tab->last_status = 2;
+        return;
+    }
 
     if (command_needs_bash(expanded)) {
         start_bash_command(tab, original_command, expanded);
+        if (tab->command.active)
+            tab->command.background = run_in_background;
+        if (run_in_background) {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "[1] %ld started in background",
+                     (long)tab->command.pid);
+            add_line(&tab->buffer, message);
+        }
         return;
     }
 
     if (has_pipeline(expanded)) {
         start_pipeline(tab, original_command, expanded);
+        if (tab->command.active)
+            tab->command.background = run_in_background;
+        if (run_in_background) {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "[1] %ld started in background",
+                     (long)tab->command.pid);
+            add_line(&tab->buffer, message);
+        }
         return;
     }
 
@@ -1678,6 +1741,13 @@ static void start_command(TerminalTab *tab, const char *original_command)
 
     snprintf(tab->command.command_text,
              sizeof(tab->command.command_text), "%s", original_command);
+    tab->command.background = run_in_background;
+    if (run_in_background) {
+        char message[LINE_SIZE];
+        snprintf(message, sizeof(message), "[1] %ld started in background",
+                 (long)pid);
+        add_line(&tab->buffer, message);
+    }
 }
 
 /* Read output without blocking the X11 event loop. */
@@ -1823,7 +1893,7 @@ static void draw_window(void)
                     (int)strlen(tab->buffer.lines[i]));
     }
 
-    if ((!tab->command.active || tab->command.stopped) && !tab->watch.active) {
+    if ((!tab->command.active || tab->command.stopped || tab->command.background) && !tab->watch.active) {
         if (y > window_height - 5)
             y = window_height - 5;
 
@@ -1909,7 +1979,7 @@ static void handle_key(XKeyEvent *event)
 
     TerminalTab *tab = &tabs[active_tab];
 
-    if (key == XK_Up && !(tab->command.active && !tab->command.stopped) && !tab->watch.active) {
+    if (key == XK_Up && !(tab->command.active && !tab->command.stopped && !tab->command.background) && !tab->watch.active) {
         if (command_history.count > 0) {
             if (tab->history_position == 0) {
                 memmove(tab->saved_input, tab->input, tab->input_length + 1);
@@ -2041,7 +2111,7 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    if ((tab->command.active && !tab->command.stopped) || tab->watch.active)
+    if ((tab->command.active && !tab->command.stopped && !tab->command.background) || tab->watch.active)
         return;
 
     if (key == XK_BackSpace) {
@@ -2296,7 +2366,7 @@ int main(void)
                     if (XGetWindowProperty(display, window, sel->property, 0, INPUT_SIZE,
                             True, AnyPropertyType, &actual, &format, &nitems, &after, &data) == Success && data) {
                         TerminalTab *tab = &tabs[active_tab];
-                        if (!(tab->command.active && !tab->command.stopped) && !tab->watch.active) {
+                        if (!(tab->command.active && !tab->command.stopped && !tab->command.background) && !tab->watch.active) {
                             size_t add = nitems;
                             if (add > sizeof(tab->input)-1-tab->input_length) add=sizeof(tab->input)-1-tab->input_length;
                             memmove(tab->input+tab->input_cursor+add, tab->input+tab->input_cursor,
