@@ -1,13 +1,15 @@
-//task 1 to 6 completed
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/Xatom.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -75,6 +77,9 @@ typedef struct {
     TerminalBuffer buffer;
     char input[INPUT_SIZE];
     size_t input_length;
+    size_t input_cursor;
+    size_t history_position;
+    char saved_input[INPUT_SIZE];
     /* Accumulates multiline commands while quotes/substitutions continue. */
     char pending_command[INPUT_SIZE];
     size_t pending_length;
@@ -99,6 +104,18 @@ static Window window;
 static GC gc;
 static XFontStruct *font;
 static Atom wm_delete;
+static Atom clipboard_atom;
+static Atom utf8_atom;
+static Atom targets_atom;
+static Atom string_atom;
+static char clipboard_text[INPUT_SIZE];
+static int clipboard_owned;
+
+/* Default bindings can be overridden in ~/.terminatorrc. */
+typedef struct { KeySym key; unsigned int modifiers; } KeyBinding;
+static KeyBinding binding_ctrl_a, binding_ctrl_e, binding_ctrl_u, binding_ctrl_k;
+static KeyBinding binding_ctrl_w, binding_ctrl_l, binding_ctrl_d;
+static KeyBinding binding_copy, binding_paste;
 
 static TerminalTab tabs[MAX_TABS];
 static int tab_count = 1;
@@ -112,6 +129,113 @@ static CommandHistory command_history;
 
 static void stop_multiwatch(TerminalTab *tab);
 static void service_tab(TerminalTab *tab);
+
+/* ---------- Task 7: configurable hotkey bindings ---------- */
+static int binding_equal(KeyBinding a, KeyBinding b)
+{
+    return a.key == b.key && a.modifiers == b.modifiers;
+}
+
+static int parse_binding(const char *value, KeyBinding *out)
+{
+    char copy[80];
+    if (!value || strlen(value) >= sizeof(copy)) return 0;
+    strcpy(copy, value);
+    char *save = NULL;
+    char *token = strtok_r(copy, "+", &save);
+    unsigned int mods = 0;
+    KeySym key = NoSymbol;
+    while (token) {
+        if (strcasecmp(token, "Ctrl") == 0 || strcasecmp(token, "Control") == 0)
+            mods |= ControlMask;
+        else if (strcasecmp(token, "Shift") == 0)
+            mods |= ShiftMask;
+        else if (strcasecmp(token, "Alt") == 0)
+            mods |= Mod1Mask;
+        else {
+            KeySym candidate = XStringToKeysym(token);
+            if (candidate == NoSymbol && strlen(token) == 1)
+                candidate = (KeySym)(unsigned char)token[0];
+            if (candidate == NoSymbol || key != NoSymbol) return 0;
+            key = candidate;
+        }
+        token = strtok_r(NULL, "+", &save);
+    }
+    if (key == NoSymbol) return 0;
+    out->key = key; out->modifiers = mods;
+    return 1;
+}
+
+static void load_key_bindings(void)
+{
+    binding_ctrl_a = (KeyBinding){XK_a, ControlMask};
+    binding_ctrl_e = (KeyBinding){XK_e, ControlMask};
+    binding_ctrl_u = (KeyBinding){XK_u, ControlMask};
+    binding_ctrl_k = (KeyBinding){XK_k, ControlMask};
+    binding_ctrl_w = (KeyBinding){XK_w, ControlMask};
+    binding_ctrl_l = (KeyBinding){XK_l, ControlMask};
+    binding_ctrl_d = (KeyBinding){XK_d, ControlMask};
+    binding_copy = (KeyBinding){XK_c, ControlMask | ShiftMask};
+    binding_paste = (KeyBinding){XK_v, ControlMask | ShiftMask};
+
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/.terminatorrc", home) >= (int)sizeof(path)) return;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;
+    char line[160];
+    KeyBinding parsed;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = '\0';
+        char *eq = strchr(line, '='); if (!eq) continue;
+        *eq++ = '\0';
+        char *name = line;
+        while (*name == ' ' || *name == '\t') name++;
+        while (*eq == ' ' || *eq == '\t') eq++;
+        KeyBinding *target = NULL;
+        if (!strcmp(name,"ctrl_a")) target=&binding_ctrl_a;
+        else if (!strcmp(name,"ctrl_e")) target=&binding_ctrl_e;
+        else if (!strcmp(name,"ctrl_u")) target=&binding_ctrl_u;
+        else if (!strcmp(name,"ctrl_k")) target=&binding_ctrl_k;
+        else if (!strcmp(name,"ctrl_w")) target=&binding_ctrl_w;
+        else if (!strcmp(name,"ctrl_l")) target=&binding_ctrl_l;
+        else if (!strcmp(name,"ctrl_d")) target=&binding_ctrl_d;
+        else if (!strcmp(name,"copy")) target=&binding_copy;
+        else if (!strcmp(name,"paste")) target=&binding_paste;
+        if (!target) continue;
+        if (!parse_binding(eq, &parsed)) {
+            fprintf(stderr,"terminator: invalid binding for %s; using default\n",name);
+            continue;
+        }
+        int conflict = 0;
+        KeyBinding *all[] = {&binding_ctrl_a,&binding_ctrl_e,&binding_ctrl_u,&binding_ctrl_k,
+            &binding_ctrl_w,&binding_ctrl_l,&binding_ctrl_d,&binding_copy,&binding_paste};
+        for (size_t i=0;i<sizeof(all)/sizeof(all[0]);i++)
+            if (all[i] != target && binding_equal(parsed,*all[i])) conflict=1;
+        if (conflict) {
+            fprintf(stderr,"terminator: conflicting binding for %s; using default\n",name);
+            continue;
+        }
+        *target=parsed;
+    }
+    fclose(fp);
+}
+
+static int binding_pressed(XKeyEvent *event, KeySym key, KeyBinding binding)
+{
+    unsigned int state = event->state & (ControlMask | ShiftMask | Mod1Mask);
+    KeySym actual = XLookupKeysym(event, 0);
+    return actual == binding.key && state == binding.modifiers &&
+           (key == binding.key || actual == binding.key);
+}
+
+static void paste_clipboard(void)
+{
+    /* Request the current X11 CLIPBOARD owner to convert its contents to STRING. */
+    XConvertSelection(display, clipboard_atom, string_atom, clipboard_atom, window, CurrentTime);
+    XFlush(display);
+}
 
 /* ---------- Terminal display buffer ---------- */
 
@@ -1207,131 +1331,13 @@ static void start_bash_command(TerminalTab *tab, const char *original,
              "%s", original);
 }
 
-
-/*
- * Run an additional command while another job is in the background.
- * Keep the background job's ActiveCommand state intact. This helper is
- * synchronous (the X11 UI pauses until this short command finishes).
- */
-static void run_while_background(TerminalTab *tab, const char *command)
-{
-    int pfd[2];
-    if (pipe(pfd) == -1) {
-        add_format(&tab->buffer, "pipe: %s", strerror(errno));
-        tab->last_status = 1;
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid == -1) {
-        close(pfd[0]);
-        close(pfd[1]);
-        add_format(&tab->buffer, "fork: %s", strerror(errno));
-        tab->last_status = 1;
-        return;
-    }
-
-    if (pid == 0) {
-        close(pfd[0]);
-        (void)setpgid(0, 0);
-        if (dup2(pfd[1], STDOUT_FILENO) == -1 ||
-            dup2(pfd[1], STDERR_FILENO) == -1)
-            _exit(126);
-        close(pfd[1]);
-        if (chdir(tab->cwd) == -1) {
-            dprintf(STDERR_FILENO, "chdir: %s\n", strerror(errno));
-            _exit(126);
-        }
-        execl("/bin/bash", "bash", "--noprofile", "--norc", "-c",
-              command, (char *)NULL);
-        dprintf(STDERR_FILENO, "terminator: cannot start bash: %s\n",
-                strerror(errno));
-        _exit(127);
-    }
-
-    close(pfd[1]);
-    char data[2048];
-    char line[LINE_SIZE];
-    size_t used = 0;
-    int status = 0;
-
-    for (;;) {
-        ssize_t n = read(pfd[0], data, sizeof(data));
-        if (n > 0) {
-            for (ssize_t i = 0; i < n; ++i) {
-                unsigned char c = (unsigned char)data[i];
-                if (c == '\r')
-                    continue;
-                if (c == '\n') {
-                    line[used] = '\0';
-                    add_line(&tab->buffer, line);
-                    used = 0;
-                } else if (c >= 32 || c == '\t') {
-                    if (used < sizeof(line) - 1)
-                        line[used++] = c == '\t' ? ' ' : (char)c;
-                }
-            }
-        } else if (n == 0) {
-            break;
-        } else if (errno != EINTR) {
-            add_format(&tab->buffer, "read: %s", strerror(errno));
-            break;
-        }
-    }
-    close(pfd[0]);
-    if (used > 0) {
-        line[used] = '\0';
-        add_line(&tab->buffer, line);
-    }
-
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno == EINTR)
-            continue;
-        status = 1 << 8;
-        break;
-    }
-    if (WIFEXITED(status))
-        tab->last_status = WEXITSTATUS(status);
-    else if (WIFSIGNALED(status))
-        tab->last_status = 128 + WTERMSIG(status);
-    else
-        tab->last_status = 1;
-}
-
-static int is_persistent_builtin_name(const char *command)
-{
-    while (*command == ' ' || *command == '\t')
-        ++command;
-    char name[32];
-    size_t n = 0;
-    while (command[n] && command[n] != ' ' && command[n] != '\t' &&
-           command[n] != '\n' && n + 1 < sizeof(name)) {
-        name[n] = command[n];
-        ++n;
-    }
-    name[n] = '\0';
-    return strcmp(name, "cd") == 0 || strcmp(name, "history") == 0 ||
-           strcmp(name, "exit") == 0 || strcmp(name, "source") == 0 ||
-           strcmp(name, ".") == 0 || strcmp(name, "jobs") == 0 ||
-           strcmp(name, "fg") == 0 || strcmp(name, "bg") == 0;
-}
-
 static void start_command(TerminalTab *tab, const char *original_command)
 {
     if (tab->command.active && !tab->command.stopped) {
-        if (!tab->command.background) {
-            add_line(&tab->buffer,
-                     "A foreground command is already running in this tab.");
-            tab->last_status = 1;
-            return;
-        }
-
-        /* Do not overwrite the background job's PID/pipe state. */
-        if (!is_persistent_builtin_name(original_command)) {
-            record_command_line(tab, original_command);
-            run_while_background(tab, original_command);
-            return;
-        }
+        add_line(&tab->buffer,
+                 "A command is already running in this tab.");
+        tab->last_status = 1;
+        return;
     }
 
     if (strncmp(original_command, "multiWatch", 10) == 0 &&
@@ -1817,8 +1823,7 @@ static void draw_window(void)
                     (int)strlen(tab->buffer.lines[i]));
     }
 
-    if ((!tab->command.active || tab->command.stopped ||
-         tab->command.background) && !tab->watch.active) {
+    if ((!tab->command.active || tab->command.stopped) && !tab->watch.active) {
         if (y > window_height - 5)
             y = window_height - 5;
 
@@ -1843,6 +1848,11 @@ static void draw_window(void)
 
             XDrawString(display, window, gc, input_x, y,
                         tab->input + first, input_len - first);
+            int cursor_chars = (int)tab->input_cursor - first;
+            if (cursor_chars < 0) cursor_chars = 0;
+            if (cursor_chars > input_len - first) cursor_chars = input_len - first;
+            int cursor_x = input_x + XTextWidth(font, tab->input + first, cursor_chars);
+            XDrawLine(display, window, gc, cursor_x, y - 14, cursor_x, y + 3);
         }
     }
 
@@ -1860,6 +1870,7 @@ static void handle_key(XKeyEvent *event)
                                &key, NULL);
 
     int ctrl = (event->state & ControlMask) != 0;
+    int shift = (event->state & ShiftMask) != 0;
 
     if (ctrl && (key == XK_t || key == XK_T)) {
         if (tab_count < MAX_TABS) {
@@ -1873,7 +1884,7 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    if (ctrl && (key == XK_w || key == XK_W)) {
+    if (ctrl && shift && (key == XK_w || key == XK_W)) {
         close_tab(active_tab);
         return;
     }
@@ -1898,6 +1909,75 @@ static void handle_key(XKeyEvent *event)
 
     TerminalTab *tab = &tabs[active_tab];
 
+    if (key == XK_Up && !(tab->command.active && !tab->command.stopped) && !tab->watch.active) {
+        if (command_history.count > 0) {
+            if (tab->history_position == 0) {
+                memmove(tab->saved_input, tab->input, tab->input_length + 1);
+                tab->history_position = command_history.count + 1;
+            }
+            if (tab->history_position > 1) tab->history_position--;
+            size_t idx = (command_history.next + MAX_HISTORY -
+                          (command_history.count - (tab->history_position - 1))) % MAX_HISTORY;
+            if (tab->history_position <= command_history.count) {
+                snprintf(tab->input, sizeof(tab->input), "%s", command_history.commands[idx]);
+                tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
+            }
+        }
+        return;
+    }
+    if (key == XK_Down && tab->history_position > 0) {
+        if (tab->history_position < command_history.count) {
+            tab->history_position++;
+            size_t idx = (command_history.next + MAX_HISTORY -
+                          (command_history.count - (tab->history_position - 1))) % MAX_HISTORY;
+            snprintf(tab->input, sizeof(tab->input), "%s", command_history.commands[idx]);
+            tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
+        } else {
+            tab->history_position = 0;
+            memmove(tab->input, tab->saved_input, strlen(tab->saved_input) + 1);
+            tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
+        }
+        return;
+    }
+    if (key == XK_Left) { if (tab->input_cursor > 0) tab->input_cursor--; return; }
+    if (key == XK_Right) { if (tab->input_cursor < tab->input_length) tab->input_cursor++; return; }
+
+    if (binding_pressed(event, key, binding_ctrl_a)) { tab->input_cursor=0; return; }
+    if (binding_pressed(event, key, binding_ctrl_e)) { tab->input_cursor=tab->input_length; return; }
+    if (binding_pressed(event, key, binding_ctrl_u)) {
+        memmove(tab->input, tab->input + tab->input_cursor,
+                tab->input_length - tab->input_cursor + 1);
+        tab->input_length -= tab->input_cursor; tab->input_cursor=0; return;
+    }
+    if (binding_pressed(event, key, binding_ctrl_k)) {
+        tab->input[tab->input_cursor]='\0'; tab->input_length=tab->input_cursor; return;
+    }
+    if (binding_pressed(event, key, binding_ctrl_w)) {
+        size_t start=tab->input_cursor;
+        while (start>0 && tab->input[start-1]==' ') start--;
+        while (start>0 && tab->input[start-1]!=' ') start--;
+        memmove(tab->input+start, tab->input+tab->input_cursor,
+                tab->input_length-tab->input_cursor+1);
+        tab->input_length -= tab->input_cursor-start; tab->input_cursor=start; return;
+    }
+    if (binding_pressed(event, key, binding_ctrl_l)) { tab->buffer.count=0; tab->scroll_offset=0; return; }
+    if (binding_pressed(event, key, binding_ctrl_d)) {
+        if (tab->input_length == 0) close_tab(active_tab);
+        else if (tab->input_cursor < tab->input_length) {
+            memmove(tab->input+tab->input_cursor, tab->input+tab->input_cursor+1,
+                    tab->input_length-tab->input_cursor);
+            tab->input_length--;
+        }
+        return;
+    }
+    if (binding_pressed(event, key, binding_copy)) {
+        snprintf(clipboard_text, sizeof(clipboard_text), "%s", tab->input);
+        XSetSelectionOwner(display, clipboard_atom, window, CurrentTime);
+        clipboard_owned = (XGetSelectionOwner(display, clipboard_atom) == window);
+        return;
+    }
+    if (binding_pressed(event, key, binding_paste)) { paste_clipboard(); return; }
+
     if (key == XK_Up) {
         int visible =
             (window_height - HEADER_HEIGHT - 40) / LINE_HEIGHT;
@@ -1914,7 +1994,7 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    if (key == XK_Down) {
+    if (key == XK_Down && tab->history_position == 0) {
         if (tab->scroll_offset > 0) {
             tab->scroll_offset++;
 
@@ -1961,14 +2041,23 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    /* A background job must not block keyboard input; foreground jobs do. */
-    if ((tab->command.active && !tab->command.stopped &&
-         !tab->command.background) || tab->watch.active)
+    if ((tab->command.active && !tab->command.stopped) || tab->watch.active)
         return;
 
     if (key == XK_BackSpace) {
-        if (tab->input_length > 0)
-            tab->input[--tab->input_length] = '\0';
+        if (tab->input_cursor > 0) {
+            memmove(tab->input + tab->input_cursor - 1, tab->input + tab->input_cursor,
+                    tab->input_length - tab->input_cursor + 1);
+            tab->input_cursor--; tab->input_length--;
+        }
+        return;
+    }
+    if (key == XK_Delete) {
+        if (tab->input_cursor < tab->input_length) {
+            memmove(tab->input + tab->input_cursor, tab->input + tab->input_cursor + 1,
+                    tab->input_length - tab->input_cursor);
+            tab->input_length--;
+        }
         return;
     }
 
@@ -2015,6 +2104,8 @@ static void handle_key(XKeyEvent *event)
         tab->pending_command[tab->pending_length] = '\0';
 
         tab->input_length = 0;
+        tab->input_cursor = 0;
+        tab->history_position = 0;
         tab->input[0] = '\0';
 
         if (backslash_continuation ||
@@ -2035,16 +2126,18 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    if (!ctrl && length > 0 &&
-        tab->input_length + (size_t)length < sizeof(tab->input)) {
+    if (!ctrl && length > 0 && tab->input_length + (size_t)length < sizeof(tab->input)) {
         for (int i = 0; i < length; i++) {
             unsigned char ch = (unsigned char)text[i];
-
-            if (ch >= 32 && ch <= 126)
-                tab->input[tab->input_length++] = (char)ch;
+            if (ch >= 32 && ch <= 126 && tab->input_length + 1 < sizeof(tab->input)) {
+                memmove(tab->input + tab->input_cursor + 1,
+                        tab->input + tab->input_cursor,
+                        tab->input_length - tab->input_cursor + 1);
+                tab->input[tab->input_cursor++] = (char)ch;
+                tab->input_length++;
+            }
         }
-
-        tab->input[tab->input_length] = '\0';
+        tab->history_position = 0;
     }
 }
 
@@ -2072,6 +2165,11 @@ int main(void)
     XStoreName(display, window, "Terminator - Custom Terminal");
 
     wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
+    clipboard_atom = XInternAtom(display, "CLIPBOARD", False);
+    utf8_atom = XInternAtom(display, "UTF8_STRING", False);
+    targets_atom = XInternAtom(display, "TARGETS", False);
+    string_atom = XInternAtom(display, "STRING", False);
+    load_key_bindings();
     XSetWMProtocols(display, window, &wm_delete, 1);
 
     XSelectInput(display, window,
@@ -2169,6 +2267,46 @@ int main(void)
             } else if (event.type == KeyPress) {
                 handle_key(&event.xkey);
                 draw_window();
+            } else if (event.type == SelectionRequest) {
+                XSelectionRequestEvent *req = &event.xselectionrequest;
+                XEvent reply; memset(&reply, 0, sizeof(reply));
+                reply.xselection.type = SelectionNotify;
+                reply.xselection.display = req->display; reply.xselection.requestor = req->requestor;
+                reply.xselection.selection = req->selection; reply.xselection.target = req->target;
+                reply.xselection.time = req->time; reply.xselection.property = None;
+                if (clipboard_owned && (req->target == string_atom || req->target == XA_STRING)) {
+                    Atom property = req->property == None ? req->target : req->property;
+                    XChangeProperty(display, req->requestor, property, XA_STRING, 8,
+                                    PropModeReplace, (unsigned char *)clipboard_text,
+                                    (int)strlen(clipboard_text));
+                    reply.xselection.property = property;
+                } else if (clipboard_owned && req->target == targets_atom) {
+                    Atom targets[2] = {targets_atom, string_atom};
+                    Atom property = req->property == None ? req->target : req->property;
+                    XChangeProperty(display, req->requestor, property, XA_ATOM, 32,
+                                    PropModeReplace, (unsigned char *)targets, 2);
+                    reply.xselection.property = property;
+                }
+                XSendEvent(display, req->requestor, False, 0, &reply);
+                XFlush(display);
+            } else if (event.type == SelectionNotify) {
+                XSelectionEvent *sel = &event.xselection;
+                if (sel->property != None) {
+                    Atom actual; int format; unsigned long nitems, after; unsigned char *data = NULL;
+                    if (XGetWindowProperty(display, window, sel->property, 0, INPUT_SIZE,
+                            True, AnyPropertyType, &actual, &format, &nitems, &after, &data) == Success && data) {
+                        TerminalTab *tab = &tabs[active_tab];
+                        if (!(tab->command.active && !tab->command.stopped) && !tab->watch.active) {
+                            size_t add = nitems;
+                            if (add > sizeof(tab->input)-1-tab->input_length) add=sizeof(tab->input)-1-tab->input_length;
+                            memmove(tab->input+tab->input_cursor+add, tab->input+tab->input_cursor,
+                                    tab->input_length-tab->input_cursor+1);
+                            memcpy(tab->input+tab->input_cursor, data, add);
+                            tab->input_length += add; tab->input_cursor += add;
+                        }
+                        XFree(data); draw_window();
+                    }
+                }
             } else if (event.type == ClientMessage) {
                 if ((Atom)event.xclient.data.l[0] == wm_delete)
                     running = 0;
