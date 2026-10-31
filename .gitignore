@@ -1,11 +1,17 @@
-terminator
-*.o
-window_test
-
-# Compiled executable
+# Compiled executables
+/terminator
 /terminator_multiwatch
+/window_test
 
-# Windows download metadata
+# Object files
+*.o
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Windows metadata
 *:Zone.Identifier
 
 # Temporary test outputs
