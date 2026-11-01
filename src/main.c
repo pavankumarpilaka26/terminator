@@ -18,6 +18,13 @@
 #include <signal.h>
 #include <limits.h>
 #include <time.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <sys/mman.h>
+#include <semaphore.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/file.h>
 
 #define MAX_TABS 9
 #define MAX_LINES 1000
@@ -79,6 +86,11 @@ typedef struct {
     size_t input_cursor;
     size_t history_position;
     char saved_input[INPUT_SIZE];
+    int reverse_search;
+    char search_query[INPUT_SIZE];
+    char search_original_input[INPUT_SIZE];
+    char search_match[INPUT_SIZE];
+    int search_has_match;
     /* Accumulates multiline commands while quotes/substitutions continue. */
     char pending_command[INPUT_SIZE];
     size_t pending_length;
@@ -91,6 +103,25 @@ typedef struct {
     MultiWatch watch;
     int scroll_offset;
     int last_status;
+
+    /* Pending filename-completion choices (1-9 select a displayed match). */
+    int completion_active;
+    size_t completion_start;
+    size_t completion_dir_prefix_len;
+    size_t completion_count;
+    char completion_directory[PATH_MAX];
+    char completion_matches[256][NAME_MAX + 1];
+
+    /* One command/job-service worker belongs to each tab. */
+    pthread_t worker;
+    int worker_started;
+    int worker_stop;
+    int command_pending;
+    char worker_command[INPUT_SIZE];
+
+    /* Process-mode IPC state (used only by the GUI parent). */
+    pid_t process_pid;
+    int process_fd;
 } TerminalTab;
 
 typedef struct {
@@ -135,9 +166,51 @@ static int window_width = WINDOW_WIDTH;
 static int window_height = WINDOW_HEIGHT;
 
 static CommandHistory command_history;
+#define ACTIVE_HISTORY ((process_mode && shared_history) ? shared_history->history : command_history)
+typedef struct {
+    sem_t mutex;
+    CommandHistory history;
+} SharedHistory;
+static SharedHistory *shared_history;
+static int process_mode;
+static int process_child_mode;
+static int process_child_fd = -1;
+static int process_child_exit;
+static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    int type;
+    int status;
+    int flags;
+    pid_t command_pid;
+    pid_t background_pid;
+    char cwd[PATH_MAX];
+    char text[LINE_SIZE];
+} ProcessMessage;
+
+enum { PROC_COMMAND = 1, PROC_INTERRUPT, PROC_STOP, PROC_SHUTDOWN,
+       PROC_LINE, PROC_STATE, PROC_EXIT };
+/* Serializes shared tab state; Xlib is still called only by the main thread. */
+static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t worker_condition = PTHREAD_COND_INITIALIZER;
+static int pending_close_index = -1;
+static int worker_indices[MAX_TABS] = {0,1,2,3,4,5,6,7,8};
 
 static void stop_multiwatch(TerminalTab *tab);
 static void service_tab(TerminalTab *tab);
+static void service_multiwatch(TerminalTab *tab);
+static void start_command(TerminalTab *tab, const char *original_command);
+static void close_tab(int index);
+
+/* A GUI launched from a background shell may inherit ignored job-control
+   signals.  Executed commands must receive normal interrupt/stop signals. */
+static void reset_child_signals(void)
+{
+    (void)signal(SIGINT, SIG_DFL);
+    (void)signal(SIGQUIT, SIG_DFL);
+    (void)signal(SIGTSTP, SIG_DFL);
+    (void)signal(SIGPIPE, SIG_DFL);
+}
 
 /* ---------- Task 7: configurable hotkey bindings ---------- */
 static int binding_equal(KeyBinding a, KeyBinding b)
@@ -424,6 +497,31 @@ static void draw_text_selection(TerminalTab *tab, int start, int y_first)
 
 /* ---------- Terminal display buffer ---------- */
 
+static int process_send(int fd, const ProcessMessage *message)
+{
+    ssize_t n;
+    do { n = send(fd, message, sizeof(*message), MSG_NOSIGNAL); }
+    while (n < 0 && errno == EINTR);
+    return n == (ssize_t)sizeof(*message) ? 0 : -1;
+}
+
+static void history_lock(void)
+{
+    if (process_mode && shared_history) {
+        while (sem_wait(&shared_history->mutex) == -1 && errno == EINTR) { }
+    } else {
+        pthread_mutex_lock(&history_mutex);
+    }
+}
+
+static void history_unlock(void)
+{
+    if (process_mode && shared_history)
+        (void)sem_post(&shared_history->mutex);
+    else
+        pthread_mutex_unlock(&history_mutex);
+}
+
 static void add_line(TerminalBuffer *buffer, const char *text)
 {
     if (buffer->count >= MAX_LINES) {
@@ -435,6 +533,13 @@ static void add_line(TerminalBuffer *buffer, const char *text)
     snprintf(buffer->lines[buffer->count], LINE_SIZE, "%s",
              text ? text : "");
     buffer->count++;
+    if (process_child_mode && process_child_fd >= 0) {
+        ProcessMessage message;
+        memset(&message, 0, sizeof(message));
+        message.type = PROC_LINE;
+        snprintf(message.text, sizeof(message.text), "%s", buffer->lines[buffer->count - 1]);
+        (void)process_send(process_child_fd, &message);
+    }
 }
 
 static void add_format(TerminalBuffer *buffer, const char *format,
@@ -486,19 +591,119 @@ static void flush_partial_output(TerminalTab *tab, ActiveCommand *cmd)
 
 /* ---------- Shared command history for this single-process version ---------- */
 
+static void history_file_path(char *path, size_t capacity)
+{
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') home = ".";
+    (void)snprintf(path, capacity, "%s/.terminator_history", home);
+}
+
+static void history_load(void)
+{
+    char path[PATH_MAX];
+    history_file_path(path, sizeof(path));
+    FILE *file = fopen(path, "r");
+    if (file == NULL) return;
+
+    CommandHistory *history = (process_mode && shared_history) ?
+                              &shared_history->history : &command_history;
+    char *line = NULL;
+    size_t capacity = 0;
+    ssize_t length;
+    while ((length = getline(&line, &capacity, file)) != -1) {
+        while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+            line[--length] = '\0';
+        if (length == 0) continue;
+        if (length >= INPUT_SIZE) line[INPUT_SIZE - 1] = '\0';
+        snprintf(history->commands[history->next], INPUT_SIZE, "%s", line);
+        history->next = (history->next + 1) % MAX_HISTORY;
+        if (history->count < MAX_HISTORY) history->count++;
+    }
+    free(line);
+    fclose(file);
+
+    /* Keep the persistent file bounded to the newest MAX_HISTORY entries. */
+    file = fopen(path, "w");
+    if (file != NULL) {
+        size_t first = (history->next + MAX_HISTORY - history->count) % MAX_HISTORY;
+        for (size_t i = 0; i < history->count; ++i) {
+            size_t index = (first + i) % MAX_HISTORY;
+            fprintf(file, "%s\n", history->commands[index]);
+        }
+        fclose(file);
+    }
+}
+
+static void history_persist(const char *command)
+{
+    char path[PATH_MAX];
+    history_file_path(path, sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd == -1) return;
+    if (flock(fd, LOCK_EX) == 0) {
+        /* Keep the on-disk format one command per line. */
+        char line[INPUT_SIZE + 2];
+        size_t n = 0;
+        for (size_t i = 0; command[i] && n < INPUT_SIZE; ++i) {
+            char c = command[i];
+            line[n++] = (c == '\n' || c == '\r') ? ' ' : c;
+        }
+        line[n++] = '\n';
+        size_t written = 0;
+        while (written < n) {
+            ssize_t result = write(fd, line + written, n - written);
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) break;
+            written += (size_t)result;
+        }
+        (void)flock(fd, LOCK_UN);
+    }
+    close(fd);
+}
+
+static void update_reverse_search(TerminalTab *tab)
+{
+    tab->search_has_match = 0;
+    tab->search_match[0] = '\0';
+
+    history_lock();
+
+    CommandHistory *history = (process_mode && shared_history) ?
+                              &shared_history->history : &command_history;
+
+    size_t limit = history->count;
+
+    /* Search newest to oldest; accept only a real substring match. */
+    for (size_t offset = 0; offset < limit; ++offset) {
+        size_t index =
+            (history->next + MAX_HISTORY - 1 - offset) % MAX_HISTORY;
+        const char *candidate = history->commands[index];
+
+        if (tab->search_query[0] == '\0' ||
+            strstr(candidate, tab->search_query) != NULL) {
+            snprintf(tab->search_match, sizeof(tab->search_match),
+                     "%s", candidate);
+            tab->search_has_match = 1;
+            break;
+        }
+    }
+
+    history_unlock();
+}
+
 static void history_add(const char *command)
 {
     if (command == NULL || command[0] == '\0')
         return;
 
-    snprintf(command_history.commands[command_history.next],
-             INPUT_SIZE, "%s", command);
-
-    command_history.next =
-        (command_history.next + 1) % MAX_HISTORY;
-
-    if (command_history.count < MAX_HISTORY)
-        command_history.count++;
+    history_lock();
+    CommandHistory *history = (process_mode && shared_history) ?
+                              &shared_history->history : &command_history;
+    snprintf(history->commands[history->next], INPUT_SIZE, "%s", command);
+    history->next = (history->next + 1) % MAX_HISTORY;
+    if (history->count < MAX_HISTORY) history->count++;
+    history_unlock();
+    history_persist(command);
 }
 
 static void record_command_line(TerminalTab *tab, const char *command)
@@ -515,25 +720,24 @@ static void record_command_line(TerminalTab *tab, const char *command)
 
 static void show_history(TerminalTab *tab)
 {
-    size_t shown = command_history.count;
-
-    if (shown > 1000)
-        shown = 1000;
-
-    size_t first = (command_history.next + MAX_HISTORY
-                    - shown) % MAX_HISTORY;
-
-    char line[LINE_SIZE];
-
+    char snapshot[1000][INPUT_SIZE];
+    history_lock();
+    CommandHistory *history = (process_mode && shared_history) ?
+                              &shared_history->history : &command_history;
+    size_t shown = history->count;
+    if (shown > 1000) shown = 1000;
+    size_t first = (history->next + MAX_HISTORY - shown) % MAX_HISTORY;
     for (size_t i = 0; i < shown; i++) {
         size_t index = (first + i) % MAX_HISTORY;
+        snprintf(snapshot[i], sizeof(snapshot[i]), "%s", history->commands[index]);
+    }
+    history_unlock();
 
-        snprintf(line, sizeof(line), "%zu  %.1000s",
-                 i + 1, command_history.commands[index]);
-
+    char line[LINE_SIZE];
+    for (size_t i = 0; i < shown; i++) {
+        snprintf(line, sizeof(line), "%zu  %.1000s", i + 1, snapshot[i]);
         add_line(&tab->buffer, line);
     }
-
     tab->last_status = 0;
 }
 
@@ -795,6 +999,8 @@ static void init_tab(TerminalTab *tab)
     tab->command.output_fd = -1;
     tab->background_command.pid = -1;
     tab->background_command.output_fd = -1;
+    tab->process_fd = -1;
+    tab->process_pid = -1;
     tab->last_status = 0;
 
     if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL)
@@ -821,9 +1027,186 @@ static void stop_tab_command(TerminalTab *tab)
     stop_one_command(&tab->background_command);
 }
 
+static void process_child_loop(int index, int fd)
+{
+    process_child_mode = 1;
+    process_child_fd = fd;
+    process_child_exit = 0;
+    if (display) (void)close(ConnectionNumber(display));
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    TerminalTab *tab = &tabs[index];
+    tab->process_fd = -1;
+    int alive = 1;
+    while (alive && !process_child_exit) {
+        struct pollfd pfd = {fd, POLLIN | POLLHUP, 0};
+        int pr = poll(&pfd, 1, 20);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            ProcessMessage message;
+            ssize_t n = recv(fd, &message, sizeof(message), 0);
+            if (n == (ssize_t)sizeof(message)) {
+                if (message.type == PROC_COMMAND) {
+                    tab->suppress_next_echo = 1;
+                    start_command(tab, message.text);
+                } else if (message.type == PROC_INTERRUPT) {
+                    if (tab->watch.active) stop_multiwatch(tab);
+                    if (tab->command.active && tab->command.pid > 0) {
+                        (void)kill(-tab->command.pid, SIGINT);
+                        (void)kill(tab->command.pid, SIGINT);
+                    }
+                } else if (message.type == PROC_STOP) {
+                    if (tab->command.active && tab->command.pid > 0 && !tab->command.stopped) {
+                        (void)kill(-tab->command.pid, SIGTSTP);
+                        (void)kill(tab->command.pid, SIGTSTP);
+                    }
+                } else if (message.type == PROC_SHUTDOWN) {
+                    alive = 0;
+                }
+            } else if (n == 0) alive = 0;
+        } else if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
+            alive = 0;
+        } else if (pr < 0 && errno != EINTR) alive = 0;
+
+        service_tab(tab);
+        service_multiwatch(tab);
+
+        ProcessMessage state;
+        memset(&state, 0, sizeof(state));
+        state.type = PROC_STATE;
+        state.status = tab->last_status;
+        state.flags = (tab->command.active ? 1 : 0) |
+                      (tab->command.stopped ? 2 : 0) |
+                      (tab->background_command.active ? 4 : 0) |
+                      (tab->watch.active ? 8 : 0);
+        state.command_pid = tab->command.pid;
+        state.background_pid = tab->background_command.pid;
+        snprintf(state.cwd, sizeof(state.cwd), "%s", tab->cwd);
+        if (process_send(fd, &state) == -1) alive = 0;
+    }
+    stop_tab_command(tab);
+    ProcessMessage done;
+    memset(&done, 0, sizeof(done));
+    done.type = PROC_EXIT;
+    done.status = process_child_exit ? 1 : 0;
+    (void)process_send(fd, &done);
+    close(fd);
+    _exit(EXIT_SUCCESS);
+}
+
+static int start_process_tab(int index)
+{
+    int pair[2];
+    if (index < 0 || index >= MAX_TABS || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == -1)
+        return -1;
+    (void)fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pair[1], F_SETFD, FD_CLOEXEC);
+    pid_t pid = fork();
+    if (pid == -1) { close(pair[0]); close(pair[1]); return -1; }
+    if (pid == 0) {
+        close(pair[0]);
+        /* Do not keep sibling tabs' IPC endpoints alive in this child. */
+        for (int i = 0; i < tab_count; ++i) {
+            if (i != index && tabs[i].process_fd >= 0)
+                close(tabs[i].process_fd);
+        }
+        process_child_loop(index, pair[1]);
+    }
+    close(pair[1]);
+    tabs[index].process_pid = pid;
+    tabs[index].process_fd = pair[0];
+    tabs[index].command.pid = -1;
+    tabs[index].background_command.pid = -1;
+    return 0;
+}
+
+static void service_process_tabs(void)
+{
+    for (int i = 0; i < tab_count; ++i) {
+        TerminalTab *tab = &tabs[i];
+        if (tab->process_fd < 0) continue;
+        for (;;) {
+            ProcessMessage message;
+            ssize_t n = recv(tab->process_fd, &message, sizeof(message), MSG_DONTWAIT);
+            if (n == (ssize_t)sizeof(message)) {
+                if (message.type == PROC_LINE) add_line(&tab->buffer, message.text);
+                else if (message.type == PROC_STATE) {
+                    snprintf(tab->cwd, sizeof(tab->cwd), "%s", message.cwd);
+                    tab->last_status = message.status;
+                    tab->command.active = (message.flags & 1) != 0;
+                    tab->command.stopped = (message.flags & 2) != 0;
+                    tab->command.pid = message.command_pid;
+                    tab->background_command.active = (message.flags & 4) != 0;
+                    tab->background_command.pid = message.background_pid;
+                    tab->watch.active = (message.flags & 8) != 0;
+                } else if (message.type == PROC_EXIT) {
+                    int should_close_tab = message.status == 1;
+                    close(tab->process_fd);
+                    tab->process_fd = -1;
+                    if (tab->process_pid > 0) {
+                        int child_status;
+                        while (waitpid(tab->process_pid, &child_status, 0) == -1 && errno == EINTR) { }
+                    }
+                    tab->process_pid = -1;
+                    if (should_close_tab) {
+                        if (tab_count > 1) {
+                            close_tab(i);
+                            --i;
+                        } else {
+                            running = 0;
+                        }
+                    } else {
+                        add_line(&tab->buffer, "[tab process exited unexpectedly]");
+                    }
+                    break;
+                }
+            } else {
+                if (n == 0) {
+                    close(tab->process_fd);
+                    tab->process_fd = -1;
+                    if (tab->process_pid > 0) {
+                        int child_status;
+                        while (waitpid(tab->process_pid, &child_status, 0) == -1 && errno == EINTR) { }
+                    }
+                    tab->process_pid = -1;
+                    add_line(&tab->buffer, "[tab process exited unexpectedly]");
+                }
+                break;
+            }
+        }
+    }
+}
+
 static void close_tab(int index)
 {
-    if (index < 0 || index >= tab_count)
+    if (process_mode) {
+        if (index < 0 || index >= tab_count) return;
+        if (tab_count == 1) {
+            add_line(&tabs[0].buffer, "Cannot close the last tab. Use exit or Escape.");
+            return;
+        }
+        TerminalTab *closing = &tabs[index];
+        if (closing->process_fd >= 0) {
+            ProcessMessage shutdown;
+            memset(&shutdown, 0, sizeof(shutdown)); shutdown.type = PROC_SHUTDOWN;
+            (void)process_send(closing->process_fd, &shutdown);
+            close(closing->process_fd);
+            closing->process_fd = -1;
+        }
+        if (closing->process_pid > 0) {
+            int status;
+            while (waitpid(closing->process_pid, &status, 0) == -1 && errno == EINTR) { }
+        }
+        for (int i = index; i < tab_count - 1; ++i) tabs[i] = tabs[i + 1];
+        tab_count--;
+        memset(&tabs[tab_count], 0, sizeof(tabs[tab_count]));
+        tabs[tab_count].process_fd = -1;
+        if (active_tab >= tab_count) active_tab = tab_count - 1;
+        else if (active_tab > index) active_tab--;
+        return;
+    }
+    /* Actual joining/compaction is performed by the GUI thread after it
+       releases state_mutex.  This also works when called by a tab worker
+       for the exit built-in. */
+    if (index < 0 || index >= tab_count || pending_close_index >= 0)
         return;
 
     if (tab_count == 1) {
@@ -832,18 +1215,25 @@ static void close_tab(int index)
         return;
     }
 
-    stop_tab_command(&tabs[index]);
+    pending_close_index = index;
 
-    for (int i = index; i < tab_count - 1; i++)
-        tabs[i] = tabs[i + 1];
+    /* Stop the closing tab's jobs now, before allowing its worker to exit. */
+    TerminalTab *closing = &tabs[index];
+    ActiveCommand *jobs[2] = {&closing->command, &closing->background_command};
+    for (int j = 0; j < 2; ++j) {
+        if (jobs[j]->active && jobs[j]->pid > 0) {
+            (void)kill(-jobs[j]->pid, SIGTERM);
+            (void)kill(jobs[j]->pid, SIGTERM);
+        }
+    }
+    stop_multiwatch(closing);
 
-    tab_count--;
-
-    if (active_tab >= tab_count)
-        active_tab = tab_count - 1;
-    else if (active_tab > index)
-        active_tab--;
+    /* All workers are stopped before the fixed tab array is compacted. */
+    for (int i = 0; i < tab_count; ++i)
+        tabs[i].worker_stop = 1;
+    pthread_cond_broadcast(&worker_condition);
 }
+
 
 /* Add spaces around shell redirection operators, except inside quotes. */
 static void normalize_redirections(char *dst, size_t cap, const char *src)
@@ -995,9 +1385,10 @@ static void run_pipeline_child(const char *cwd, const char *command)
         pid_t pid = fork();
         if (pid == -1) {
             dprintf(STDERR_FILENO, "fork: %s\n", strerror(errno));
-            _exit(1);
+            _exit(1);_exit(1);
         }
         if (pid == 0) {
+            reset_child_signals();
             if (pgid > 0) (void)setpgid(0, pgid);
             if (previous_read >= 0 && dup2(previous_read, STDIN_FILENO) == -1) _exit(126);
             if (next_pipe[1] >= 0 && dup2(next_pipe[1], STDOUT_FILENO) == -1) _exit(126);
@@ -1084,6 +1475,7 @@ static void start_pipeline(TerminalTab *tab, const char *original,
         return;
     }
     if (pid == 0) {
+        reset_child_signals();
         (void)setpgid(0, 0);
         close(output_pipe[0]);
         if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
@@ -1178,6 +1570,7 @@ static int launch_watch_command(TerminalTab *tab, WatchCommand *wc)
     }
 
     if (pid == 0) {
+        reset_child_signals();
         (void)setpgid(0, 0);
         close(pfd[0]);
         if (dup2(pfd[1], STDOUT_FILENO) == -1 ||
@@ -1392,7 +1785,7 @@ static void service_multiwatch(TerminalTab *tab)
             watch_flush_partial(tab, wc);
             add_line(&tab->buffer, WATCH_SEPARATOR);
             char status_line[LINE_SIZE];
-            snprintf(status_line, sizeof(status_line), "[%s completed; exit status %d]",
+            snprintf(status_line, sizeof(status_line), "[%.900s completed; exit status %d]",
                      wc->text, wc->exit_status);
             add_line(&tab->buffer, status_line);
             add_line(&tab->buffer, WATCH_SEPARATOR);
@@ -1485,6 +1878,7 @@ static void start_bash_command(TerminalTab *tab, const char *original,
         return;
     }
     if (pid == 0) {
+        reset_child_signals();
         (void)setpgid(0, 0);
         close(pfd[0]);
         if (dup2(pfd[1], STDOUT_FILENO) == -1 ||
@@ -1693,8 +2087,12 @@ static void start_command(TerminalTab *tab, const char *original_command)
 
     /* Built-in: exit */
     if (strcmp(argv[0], "exit") == 0) {
+        if (process_child_mode) {
+            process_child_exit = 1;
+            return;
+        }
         if (tab_count > 1) {
-            close_tab(active_tab);
+            close_tab((int)(tab - tabs));
         } else {
             running = 0;
         }
@@ -1878,6 +2276,7 @@ static void start_command(TerminalTab *tab, const char *original_command)
     }
 
     if (pid == 0) {
+        reset_child_signals();
         (void)setpgid(0, 0);
         close(pipefd[0]);
 
@@ -1894,8 +2293,7 @@ static void start_command(TerminalTab *tab, const char *original_command)
         }
 
         if (input_path) {
-            int fd = open(input_path, O_RDONLY);
-            if (fd == -1) { dprintf(STDERR_FILENO, "%s: %s\n", input_path, strerror(errno)); _exit(1); }
+            int fd = open(input_path, O_RDONLY);if (fd == -1) { dprintf(STDERR_FILENO, "%s: %s\n", input_path, strerror(errno)); _exit(1); }
             if (dup2(fd, STDIN_FILENO) == -1) { dprintf(STDERR_FILENO, "dup2: %s\n", strerror(errno)); close(fd); _exit(1); }
             close(fd);
         }
@@ -1997,6 +2395,162 @@ static void service_tab(TerminalTab *tab)
     service_one_command(tab,&tab->background_command,1);
 }
 
+/* Worker threads never call Xlib.  They own command launch and job servicing. */
+static void *tab_worker_main(void *argument)
+{
+    int index = *(const int *)argument;
+
+    for (;;) {
+        pthread_mutex_lock(&state_mutex);
+        if (index < 0 || index >= tab_count || tabs[index].worker_stop) {
+            pthread_mutex_unlock(&state_mutex);
+            break;
+        }
+
+        TerminalTab *tab = &tabs[index];
+        if (tab->command_pending) {
+            char command[INPUT_SIZE];
+            snprintf(command, sizeof(command), "%s", tab->worker_command);
+            tab->worker_command[0] = '\0';
+            tab->command_pending = 0;
+            start_command(tab, command);
+        }
+
+        service_tab(tab);
+        service_multiwatch(tab);
+
+        if (!tab->worker_stop && !tab->command_pending) {
+            struct timespec deadline;
+            (void)clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_nsec += 20000000L;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec++;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            (void)pthread_cond_timedwait(&worker_condition, &state_mutex,
+                                         &deadline);
+        }
+        pthread_mutex_unlock(&state_mutex);
+    }
+    return NULL;
+}
+
+static int start_tab_worker(int index)
+{
+    if (index < 0 || index >= MAX_TABS)
+        return -1;
+    tabs[index].worker_stop = 0;
+    tabs[index].command_pending = 0;
+    tabs[index].worker_command[0] = '\0';
+    int error = pthread_create(&tabs[index].worker, NULL,
+                               tab_worker_main, &worker_indices[index]);
+    if (error != 0) {
+        char message[LINE_SIZE];
+        snprintf(message, sizeof(message), "pthread_create: %s", strerror(error));
+        add_line(&tabs[index].buffer, message);
+        tabs[index].worker_started = 0;
+        return -1;
+    }
+    tabs[index].worker_started = 1;
+    return 0;
+}
+
+static void enqueue_tab_command(TerminalTab *tab, const char *command)
+{
+    if (process_mode) {
+        ProcessMessage message;
+        memset(&message, 0, sizeof(message));
+        message.type = PROC_COMMAND;
+        snprintf(message.text, sizeof(message.text), "%s", command);
+        if (tab->process_fd < 0 || process_send(tab->process_fd, &message) == -1) {
+            add_line(&tab->buffer, "This tab's process worker is not available.");
+            tab->last_status = 1;
+        }
+        return;
+    }
+    if (!tab->worker_started || tab->worker_stop) {
+        add_line(&tab->buffer, "This tab's command worker is not available.");
+        tab->last_status = 1;
+        return;
+    }
+    if (tab->command_pending) {
+        add_line(&tab->buffer, "A command is already queued in this tab.");
+        tab->last_status = 1;
+        return;
+    }
+    snprintf(tab->worker_command, sizeof(tab->worker_command), "%s", command);
+    tab->command_pending = 1;
+    pthread_cond_broadcast(&worker_condition);
+}
+
+/* Called by the main thread only, with state_mutex unlocked. */
+static void finish_pending_tab_close(void)
+{
+    int index = pending_close_index;
+    if (index < 0)
+        return;
+
+    for (int i = 0; i < tab_count; ++i) {
+        if (tabs[i].worker_started) {
+            (void)pthread_join(tabs[i].worker, NULL);
+            tabs[i].worker_started = 0;
+        }
+    }
+
+    pthread_mutex_lock(&state_mutex);
+    if (index >= 0 && index < tab_count && tab_count > 1) {
+        stop_tab_command(&tabs[index]);
+        for (int i = index; i < tab_count - 1; ++i)
+            tabs[i] = tabs[i + 1];
+        tab_count--;
+        if (active_tab >= tab_count)
+            active_tab = tab_count - 1;
+        else if (active_tab > index)
+            active_tab--;
+    }
+    pending_close_index = -1;
+
+    for (int i = 0; i < tab_count; ++i) {
+        tabs[i].worker_started = 0;
+        tabs[i].worker_stop = 0;
+        tabs[i].command_pending = 0;
+        (void)start_tab_worker(i);
+    }
+    pthread_mutex_unlock(&state_mutex);
+}
+
+static void stop_all_tab_workers(void)
+{
+    if (process_mode) {
+        for (int i = 0; i < tab_count; ++i) {
+            if (tabs[i].process_fd >= 0) {
+                ProcessMessage shutdown; memset(&shutdown, 0, sizeof(shutdown));
+                shutdown.type = PROC_SHUTDOWN;
+                (void)process_send(tabs[i].process_fd, &shutdown);
+                close(tabs[i].process_fd); tabs[i].process_fd = -1;
+            }
+            if (tabs[i].process_pid > 0) {
+                int status;
+                while (waitpid(tabs[i].process_pid, &status, 0) == -1 && errno == EINTR) { }
+                tabs[i].process_pid = -1;
+            }
+        }
+        return;
+    }
+    pthread_mutex_lock(&state_mutex);
+    for (int i = 0; i < tab_count; ++i)
+        tabs[i].worker_stop = 1;
+    pthread_cond_broadcast(&worker_condition);
+    pthread_mutex_unlock(&state_mutex);
+
+    for (int i = 0; i < tab_count; ++i) {
+        if (tabs[i].worker_started) {
+            (void)pthread_join(tabs[i].worker, NULL);
+            tabs[i].worker_started = 0;
+        }
+    }
+}
+
 /* Scroll the terminal output. Positive delta moves toward older output. */
 static void scroll_buffer(TerminalTab *tab, int delta)
 {
@@ -2089,35 +2643,72 @@ static void draw_window(void)
     }
 
     if ((!tab->command.active || tab->command.stopped || tab->command.background) && !tab->watch.active) {
-        if (y > window_height - 5)
-            y = window_height - 5;
+        if (tab->reverse_search) {
+            /* Inline reverse search in the existing terminal window (no popup). */
+            int bar_height = LINE_HEIGHT * 3 + 10;
+            int bar_y = window_height - bar_height;
+            if (bar_y < HEADER_HEIGHT) bar_y = HEADER_HEIGHT;
+            unsigned long foreground = BlackPixel(display, DefaultScreen(display));
+            unsigned long background = WhitePixel(display, DefaultScreen(display));
 
-        const char *visible_prompt = tab->continuation_mode ? "> " : PROMPT;
-        XDrawString(display, window, gc, LEFT_MARGIN, y,
-                    visible_prompt, (int)strlen(visible_prompt));
+            XSetForeground(display, gc, background);
+            XFillRectangle(display, window, gc, 0, bar_y,
+                           (unsigned int)window_width,
+                           (unsigned int)(window_height - bar_y));
+            XSetForeground(display, gc, foreground);
+            XDrawLine(display, window, gc, 0, bar_y,
+                      window_width, bar_y);
 
-        int prompt_width =
-            XTextWidth(font, visible_prompt, (int)strlen(visible_prompt));
+            char search_line[INPUT_SIZE + 64];
+            snprintf(search_line, sizeof(search_line), "(reverse-i-search) Enter search term: %s%s",
+                     tab->search_query, tab->search_query[0] ? "" : "_");
+            int search_len = (int)strlen(search_line);
+            int max_width = window_width - 2 * LEFT_MARGIN;
+            while (search_len > 0 && XTextWidth(font, search_line, search_len) > max_width) {
+                memmove(search_line, search_line + 1, (size_t)search_len);
+                search_len--;
+            }
+            XDrawString(display, window, gc, LEFT_MARGIN, bar_y + LINE_HEIGHT,
+                        search_line, search_len);
 
-        int input_x = LEFT_MARGIN + prompt_width;
-        int available_width = window_width - input_x - LEFT_MARGIN;
-
-        if (available_width > 0) {
-            int input_len = (int)tab->input_length;
-            int first = 0;
-
-            while (first < input_len &&
-                   XTextWidth(font, tab->input + first,
-                              input_len - first) > available_width)
-                first++;
-
-            XDrawString(display, window, gc, input_x, y,
-                        tab->input + first, input_len - first);
-            int cursor_chars = (int)tab->input_cursor - first;
-            if (cursor_chars < 0) cursor_chars = 0;
-            if (cursor_chars > input_len - first) cursor_chars = input_len - first;
-            int cursor_x = input_x + XTextWidth(font, tab->input + first, cursor_chars);
-            XDrawLine(display, window, gc, cursor_x, y - 14, cursor_x, y + 3);
+            char match_line[INPUT_SIZE + 64];
+            if (tab->search_has_match)
+                snprintf(match_line, sizeof(match_line), "Match: %s", tab->search_match);
+            else
+                snprintf(match_line, sizeof(match_line), "Match: (no matching command)");
+            int match_len = (int)strlen(match_line);
+            while (match_len > 0 && XTextWidth(font, match_line, match_len) > max_width) {
+                memmove(match_line, match_line + 1, (size_t)match_len);
+                match_len--;
+            }
+            XDrawString(display, window, gc, LEFT_MARGIN, bar_y + 2 * LINE_HEIGHT,
+                        match_line, match_len);
+            XDrawString(display, window, gc, LEFT_MARGIN, bar_y + 3 * LINE_HEIGHT,
+                        "Enter: accept    Esc: cancel    Ctrl+R: next match",
+                        (int)strlen("Enter: accept    Esc: cancel    Ctrl+R: next match"));
+        } else {
+            if (y > window_height - 5)
+                y = window_height - 5;
+            const char *visible_prompt = tab->continuation_mode ? "> " : PROMPT;
+            XDrawString(display, window, gc, LEFT_MARGIN, y,
+                        visible_prompt, (int)strlen(visible_prompt));
+            int prompt_width = XTextWidth(font, visible_prompt, (int)strlen(visible_prompt));
+            int input_x = LEFT_MARGIN + prompt_width;
+            int available_width = window_width - input_x - LEFT_MARGIN;
+            if (available_width > 0) {
+                int visible_length = (int)tab->input_length;
+                int first = 0;
+                while (first < visible_length &&
+                       XTextWidth(font, tab->input + first, visible_length - first) > available_width)
+                    first++;
+                XDrawString(display, window, gc, input_x, y,
+                            tab->input + first, visible_length - first);
+                int cursor_chars = (int)tab->input_cursor - first;
+                if (cursor_chars < 0) cursor_chars = 0;
+                if (cursor_chars > visible_length - first) cursor_chars = visible_length - first;
+                int cursor_x = input_x + XTextWidth(font, tab->input + first, cursor_chars);
+                XDrawLine(display, window, gc, cursor_x, y - 14, cursor_x, y + 3);
+            }
         }
     }
 
@@ -2126,6 +2717,161 @@ static void draw_window(void)
 }
 
 /* ---------- Keyboard controls ---------- */
+
+static void select_autocomplete_match(TerminalTab *tab, size_t choice)
+{
+    if (!tab->completion_active || choice >= tab->completion_count) return;
+
+    const char *name = tab->completion_matches[choice];
+    size_t start = tab->completion_start;
+    size_t dir_len = tab->completion_dir_prefix_len;
+    size_t name_len = strlen(name);
+    size_t old_len = tab->input_length;
+    size_t old_cursor = tab->input_cursor;
+    if (start > old_cursor || old_cursor > old_len || start + dir_len > old_cursor) {
+        tab->completion_active = 0;
+        return;
+    }
+
+    char replacement[INPUT_SIZE];
+    size_t new_token_len = dir_len + name_len;
+    size_t tail_len = old_len - old_cursor;
+    if (start + new_token_len + tail_len + 2 >= sizeof(replacement)) {
+        tab->completion_active = 0;
+        return;
+    }
+
+    memcpy(replacement, tab->input, start);
+    if (dir_len > 0)
+        memcpy(replacement + start, tab->input + start, dir_len);
+    memcpy(replacement + start + dir_len, name, name_len);
+    memcpy(replacement + start + new_token_len, tab->input + old_cursor, tail_len);
+    size_t new_len = start + new_token_len + tail_len;
+    replacement[new_len] = '\0';
+
+    char full_path[PATH_MAX];
+    struct stat st;
+    int is_directory = 0;
+    if (snprintf(full_path, sizeof(full_path), "%s/%s",
+                 tab->completion_directory, name) < (int)sizeof(full_path) &&
+        stat(full_path, &st) == 0 && S_ISDIR(st.st_mode))
+        is_directory = 1;
+
+    char suffix = is_directory ? '/' : ' ';
+    if (new_len + 1 < sizeof(replacement)) {
+        memmove(replacement + start + new_token_len + 1,
+                replacement + start + new_token_len,
+                tail_len + 1);
+        replacement[start + new_token_len] = suffix;
+        new_len++;
+    }
+
+    memcpy(tab->input, replacement, new_len + 1);
+    tab->input_length = new_len;
+    tab->input_cursor = start + new_token_len + 1;
+    tab->completion_active = 0;
+    tab->completion_count = 0;
+}
+
+static void autocomplete_filename(TerminalTab *tab)
+{
+    size_t cursor = tab->input_cursor;
+    size_t start = cursor;
+    while (start > 0 && tab->input[start - 1] != ' ' && tab->input[start - 1] != '\t' &&
+           tab->input[start - 1] != '\n' && tab->input[start - 1] != '"' && tab->input[start - 1] != '\'')
+        --start;
+    char token[PATH_MAX];
+    size_t token_len = cursor - start;
+    if (token_len >= sizeof(token)) return;
+    memcpy(token, tab->input + start, token_len); token[token_len] = '\0';
+
+    char directory_part[PATH_MAX] = "";
+    char prefix[PATH_MAX];
+    snprintf(prefix, sizeof(prefix), "%s", token);
+    char *slash = strrchr(prefix, '/');
+    if (slash) {
+        *slash = '\0';
+        snprintf(directory_part, sizeof(directory_part), "%s", prefix);
+        memmove(prefix, slash + 1, strlen(slash + 1) + 1);
+    }
+
+    char directory[PATH_MAX];
+    if (directory_part[0] == '/') snprintf(directory, sizeof(directory), "%s", directory_part);
+    else if (directory_part[0] == '\0') snprintf(directory, sizeof(directory), "%s", tab->cwd);
+    else if (snprintf(directory, sizeof(directory), "%s/%s", tab->cwd, directory_part) >= (int)sizeof(directory)) return;
+
+    DIR *dir = opendir(directory);
+    if (!dir) { add_format(&tab->buffer, "completion: cannot open %s", directory); return; }
+    char matches[256][NAME_MAX + 1];
+    size_t count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && count < 256) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) != 0) continue;
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        snprintf(matches[count], sizeof(matches[count]), "%s", entry->d_name);
+        count++;
+    }
+    closedir(dir);
+    if (count == 0) return;
+
+    size_t common = strlen(matches[0]);
+    for (size_t i = 1; i < count; ++i) {
+        size_t j = 0;
+        while (j < common && matches[i][j] == matches[0][j]) ++j;
+        common = j;
+    }
+    size_t prefix_len = strlen(prefix);
+    size_t insert_len = common > prefix_len ? common - prefix_len : 0;
+    if (count == 1 || insert_len > 0) {
+        char completed[INPUT_SIZE];
+        size_t old_len = tab->input_length;
+        if (old_len + insert_len >= sizeof(completed)) return;
+        memcpy(completed, tab->input, start);
+        memcpy(completed + start, tab->input + start, token_len);
+        /* Replace the typed basename suffix with the common completion. */
+        size_t dir_prefix_len = slash ? strlen(directory_part) + 1 : 0;
+        size_t token_base_start = start + dir_prefix_len;
+        size_t new_token_len = dir_prefix_len + common;
+        size_t tail_start = cursor;
+        size_t tail_len = old_len - tail_start;
+        memmove(completed + start + new_token_len, tab->input + tail_start, tail_len + 1);
+        if (dir_prefix_len) memcpy(completed + start, token, dir_prefix_len);
+        memcpy(completed + token_base_start, matches[0], common);
+        size_t new_len = start + new_token_len + tail_len;
+        if (new_len >= sizeof(tab->input)) return;
+        memcpy(tab->input, completed, new_len + 1);
+        tab->input_length = new_len;
+        tab->input_cursor = start + new_token_len;
+        if (count == 1) {
+            char full[PATH_MAX];
+            if (snprintf(full, sizeof(full), "%s/%s", directory, matches[0]) < (int)sizeof(full)) {
+                struct stat st;
+                if (stat(full, &st) == 0 && S_ISDIR(st.st_mode) && tab->input_cursor < sizeof(tab->input) - 1) {
+                    memmove(tab->input + tab->input_cursor + 1, tab->input + tab->input_cursor,
+                            tab->input_length - tab->input_cursor + 1);
+                    tab->input[tab->input_cursor++] = '/'; tab->input_length++;
+                } else if (tab->input_cursor < sizeof(tab->input) - 1) {
+                    memmove(tab->input + tab->input_cursor + 1, tab->input + tab->input_cursor,
+                            tab->input_length - tab->input_cursor + 1);
+                    tab->input[tab->input_cursor++] = ' '; tab->input_length++;
+                }
+            }
+        }
+    } else {
+        tab->completion_active = 1;
+        tab->completion_count = count < 9 ? count : 9;
+        tab->completion_start = start;
+        tab->completion_dir_prefix_len = slash ? strlen(directory_part) + 1 : 0;
+        snprintf(tab->completion_directory, sizeof(tab->completion_directory), "%s", directory);
+        for (size_t i = 0; i < tab->completion_count; ++i) {
+            snprintf(tab->completion_matches[i], sizeof(tab->completion_matches[i]), "%s", matches[i]);
+            char line[LINE_SIZE];
+            snprintf(line, sizeof(line), "%zu) %.900s", i + 1, matches[i]);
+            add_line(&tab->buffer, line);
+        }
+        add_line(&tab->buffer, "Press 1-9 to select a match, or Esc to cancel.");
+    }
+}
 
 static void handle_key(XKeyEvent *event)
 {
@@ -2143,6 +2889,12 @@ static void handle_key(XKeyEvent *event)
             init_tab(&tabs[tab_count]);
             active_tab = tab_count;
             tab_count++;
+            if (process_mode) {
+                if (start_process_tab(active_tab) == -1)
+                    add_line(&tabs[active_tab].buffer, "Could not create tab process.");
+            } else {
+                (void)start_tab_worker(active_tab);
+            }
         } else {
             add_line(&tabs[active_tab].buffer,
                      "Maximum number of tabs reached.");
@@ -2174,6 +2926,67 @@ static void handle_key(XKeyEvent *event)
     }
 
     TerminalTab *tab = &tabs[active_tab];
+    CommandHistory *history = (process_mode && shared_history) ? &shared_history->history : &command_history;
+
+    if (ctrl && (key == XK_r || key == XK_R) &&
+        !(tab->command.active && !tab->command.stopped && !tab->command.background) && !tab->watch.active) {
+        if (!tab->reverse_search) {
+            memmove(tab->search_original_input, tab->input, tab->input_length + 1);
+            tab->search_query[0] = '\0';
+            tab->reverse_search = 1;
+        }
+        update_reverse_search(tab);
+        return;
+    }
+    if (tab->reverse_search) {
+        if (key == XK_Escape) {
+            tab->reverse_search = 0;
+            memmove(tab->input, tab->search_original_input, strlen(tab->search_original_input) + 1);
+            tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
+            return;
+        }
+        if (key == XK_Return || key == XK_KP_Enter) {
+            if (tab->search_has_match)
+                memmove(tab->input, tab->search_match, strlen(tab->search_match) + 1);
+            else
+                memmove(tab->input, tab->search_original_input, strlen(tab->search_original_input) + 1);
+            tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
+            tab->reverse_search = 0; tab->history_position = 0;
+            return;
+        }
+        if (key == XK_BackSpace) {
+            size_t n = strlen(tab->search_query);
+            if (n > 0) tab->search_query[n - 1] = '\0';
+            update_reverse_search(tab);
+            return;
+        }
+        if (!ctrl && length > 0) {
+            size_t n = strlen(tab->search_query);
+            for (int i = 0; i < length && n + 1 < sizeof(tab->search_query); ++i) {
+                unsigned char ch = (unsigned char)text[i];
+                if (ch >= 32 && ch <= 126) tab->search_query[n++] = (char)ch;
+            }
+            tab->search_query[n] = '\0';
+            update_reverse_search(tab);
+            return;
+        }
+        return;
+    }
+
+    if (tab->completion_active) {
+        if (key >= XK_1 && key <= XK_9) {
+            select_autocomplete_match(tab, (size_t)(key - XK_1));
+            return;
+        }
+        if (key == XK_Escape) {
+            tab->completion_active = 0;
+            tab->completion_count = 0;
+            return;
+        }
+        /* Any other key cancels the old list; process the key normally. */
+        tab->completion_active = 0;
+        tab->completion_count = 0;
+    }
 
     if (key == XK_Page_Up) {
         int visible_rows =
@@ -2192,33 +3005,37 @@ static void handle_key(XKeyEvent *event)
     }
 
     if (key == XK_Up && !(tab->command.active && !tab->command.stopped && !tab->command.background) && !tab->watch.active) {
-        if (command_history.count > 0) {
+        history_lock();
+        if (history->count > 0) {
             if (tab->history_position == 0) {
                 memmove(tab->saved_input, tab->input, tab->input_length + 1);
-                tab->history_position = command_history.count + 1;
+                tab->history_position = history->count + 1;
             }
             if (tab->history_position > 1) tab->history_position--;
-            size_t idx = (command_history.next + MAX_HISTORY -
-                          (command_history.count - (tab->history_position - 1))) % MAX_HISTORY;
-            if (tab->history_position <= command_history.count) {
-                snprintf(tab->input, sizeof(tab->input), "%s", command_history.commands[idx]);
+            size_t idx = (history->next + MAX_HISTORY -
+                          (history->count - (tab->history_position - 1))) % MAX_HISTORY;
+            if (tab->history_position <= history->count) {
+                snprintf(tab->input, sizeof(tab->input), "%s", history->commands[idx]);
                 tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
             }
         }
+        history_unlock();
         return;
     }
     if (key == XK_Down && tab->history_position > 0) {
-        if (tab->history_position < command_history.count) {
+        history_lock();
+        if (tab->history_position < history->count) {
             tab->history_position++;
-            size_t idx = (command_history.next + MAX_HISTORY -
-                          (command_history.count - (tab->history_position - 1))) % MAX_HISTORY;
-            snprintf(tab->input, sizeof(tab->input), "%s", command_history.commands[idx]);
+            size_t idx = (history->next + MAX_HISTORY -
+                          (history->count - (tab->history_position - 1))) % MAX_HISTORY;
+            snprintf(tab->input, sizeof(tab->input), "%s", history->commands[idx]);
             tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
         } else {
             tab->history_position = 0;
             memmove(tab->input, tab->saved_input, strlen(tab->saved_input) + 1);
             tab->input_length = strlen(tab->input); tab->input_cursor = tab->input_length;
         }
+        history_unlock();
         return;
     }
     if (key == XK_Left) { if (tab->input_cursor > 0) tab->input_cursor--; return; }
@@ -2302,7 +3119,10 @@ static void handle_key(XKeyEvent *event)
     }
 
     if (ctrl && (key == XK_c || key == XK_C)) {
-        if (tab->watch.active) {
+        if (process_mode && tab->process_fd >= 0) {
+            ProcessMessage message; memset(&message, 0, sizeof(message));
+            message.type = PROC_INTERRUPT; (void)process_send(tab->process_fd, &message);
+        } else if (tab->watch.active) {
             stop_multiwatch(tab);
         } else if (tab->command.active && tab->command.pid > 0) {
             (void)kill(-tab->command.pid, SIGINT);
@@ -2312,7 +3132,10 @@ static void handle_key(XKeyEvent *event)
     }
 
     if (ctrl && (key == XK_z || key == XK_Z)) {
-        if (tab->command.active && tab->command.pid > 0 &&
+        if (process_mode && tab->process_fd >= 0) {
+            ProcessMessage message; memset(&message, 0, sizeof(message));
+            message.type = PROC_STOP; (void)process_send(tab->process_fd, &message);
+        } else if (tab->command.active && tab->command.pid > 0 &&
             !tab->command.stopped) {
             if (kill(-tab->command.pid, SIGTSTP) == -1)
                 (void)kill(tab->command.pid, SIGTSTP);
@@ -2323,6 +3146,11 @@ static void handle_key(XKeyEvent *event)
 
     if ((tab->command.active && !tab->command.stopped && !tab->command.background) || tab->watch.active)
         return;
+
+    if (key == XK_Tab) {
+        autocomplete_filename(tab);
+        return;
+    }
 
     if (key == XK_BackSpace) {
         if (tab->input_cursor > 0) {
@@ -2402,7 +3230,7 @@ static void handle_key(XKeyEvent *event)
         tab->continuation_mode = 0;
         tab->previous_backslash_continuation = 0;
         tab->suppress_next_echo = 1;
-        start_command(tab, command);
+        enqueue_tab_command(tab, command);
         return;
     }
 
@@ -2423,8 +3251,27 @@ static void handle_key(XKeyEvent *event)
 
 /* ---------- Main event loop ---------- */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    process_mode = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "useProcess=True") == 0 || strcmp(argv[i], "--process") == 0)
+            process_mode = 1;
+        else if (strcmp(argv[i], "useProcess=False") != 0) {
+            fprintf(stderr, "Usage: %s [useProcess=True|useProcess=False|--process]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (process_mode) {
+        shared_history = mmap(NULL, sizeof(*shared_history), PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (shared_history == MAP_FAILED) { perror("mmap shared history"); return EXIT_FAILURE; }
+        memset(shared_history, 0, sizeof(*shared_history));
+        if (sem_init(&shared_history->mutex, 1, 1) == -1) {
+            perror("sem_init"); munmap(shared_history, sizeof(*shared_history)); return EXIT_FAILURE;
+        }
+    }
+    history_load();
     display = XOpenDisplay(NULL);
 
     if (display == NULL) {
@@ -2479,59 +3326,43 @@ int main(void)
 
     memset(&command_history, 0, sizeof(command_history));
     init_tab(&tabs[0]);
+    if (process_mode) {
+        if (start_process_tab(0) == -1) {
+            fprintf(stderr, "Could not create initial tab process.\n");
+            XFreeFont(display, font); XFreeGC(display, gc);
+            XDestroyWindow(display, window); XCloseDisplay(display);
+            return EXIT_FAILURE;
+        }
+    } else {
+        (void)start_tab_worker(0);
+    }
 
     XMapWindow(display, window);
     XFlush(display);
 
     int x_fd = ConnectionNumber(display);
 
-    while (running) {
-        struct pollfd fds[1 + 2 * MAX_TABS];
-        int owners[1 + 2 * MAX_TABS];
-        nfds_t nfds = 1;
+    for (;;) {
+        pthread_mutex_lock(&state_mutex);
+        int keep_running = running;
+        pthread_mutex_unlock(&state_mutex);
+        if (!keep_running)
+            break;
 
-        fds[0].fd = x_fd;
-        fds[0].events = POLLIN;
-        fds[0].revents = 0;
-        owners[0] = -1;
-
-        for (int i = 0; i < tab_count; i++) {
-            ActiveCommand *tracked[2] = {&tabs[i].command, &tabs[i].background_command};
-            for (int k=0;k<2;k++) if (tracked[k]->active && tracked[k]->output_fd>=0) {
-                fds[nfds].fd=tracked[k]->output_fd;
-                fds[nfds].events=POLLIN|POLLHUP|POLLERR; fds[nfds].revents=0;
-                owners[nfds]=i; nfds++;
-            }
-        }
-
-        int result = poll(fds, nfds, 100);
-
+        struct pollfd x_poll;
+        x_poll.fd = x_fd;
+        x_poll.events = POLLIN;
+        x_poll.revents = 0;
+        int result = poll(&x_poll, 1, 50);
         if (result == -1 && errno != EINTR) {
             perror("poll");
             break;
         }
 
-        for (nfds_t i = 1; i < nfds; i++) {
-            if (fds[i].revents == 0)
-                continue;
+        if (process_mode) service_process_tabs();
 
-            int owner = owners[i];
-
-            if (owner < 0 || owner >= tab_count)
-                continue;
-
-            TerminalTab *tab = &tabs[owner];
-
-            if ((tab->command.active && tab->command.output_fd==fds[i].fd) ||
-                (tab->background_command.active && tab->background_command.output_fd==fds[i].fd))
-                service_tab(tab);
-        }
-
-        for (int i = 0; i < tab_count; i++) {
-            service_tab(&tabs[i]);
-            service_multiwatch(&tabs[i]);
-        }
-
+        /* Workers and GUI share tab state, but only this thread touches X11. */
+        pthread_mutex_lock(&state_mutex);
         while (XPending(display) > 0) {
             XEvent event;
             XNextEvent(display, &event);
@@ -2635,18 +3466,35 @@ int main(void)
                 if ((Atom)event.xclient.data.l[0] == wm_delete)
                     running = 0;
             }
+            if (pending_close_index >= 0)
+                break;
         }
 
         draw_window();
+        int close_requested = pending_close_index >= 0;
+        pthread_mutex_unlock(&state_mutex);
+
+        if (close_requested)
+            finish_pending_tab_close();
     }
 
-    for (int i = 0; i < tab_count; i++)
-        stop_tab_command(&tabs[i]);
+    stop_all_tab_workers();
+    if (!process_mode) {
+        pthread_mutex_lock(&state_mutex);
+        for (int i = 0; i < tab_count; i++)
+            stop_tab_command(&tabs[i]);
+        pthread_mutex_unlock(&state_mutex);
+    }
 
     XFreeFont(display, font);
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
+    if (process_mode && shared_history) {
+        (void)sem_destroy(&shared_history->mutex);
+        (void)munmap(shared_history, sizeof(*shared_history));
+        shared_history = NULL;
+    }
 
     return EXIT_SUCCESS;
 }

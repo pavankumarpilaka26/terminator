@@ -1,114 +1,159 @@
-# Terminator – A Custom Terminal Emulator
+# Terminator -- A Custom Terminal Emulator
 
-A custom terminal emulator and shell implemented in **C using X11** for Linux. The project provides a graphical terminal interface with command execution, tab management, shell features, and job control.
+Terminator is a custom graphical terminal emulator and shell implemented
+in **C using X11** for Linux. It provides a graphical terminal interface
+with command execution, multiple tabs, shell features, job control, and
+two execution modes: thread-based and process-based.
 
 ## Features
 
 ### Terminal Interface
-- Graphical terminal window using X11.
-- Multiple terminal tabs.
-- Terminal output display and scrolling.
-- Keyboard input and command execution.
-- Copy and paste support.
+
+-   Graphical terminal window built with X11.
+-   Multiple terminal tabs.
+-   Terminal output display and scrolling.
+-   Keyboard input and command execution.
+-   Copy and paste support.
+-   Text selection and configurable keyboard shortcuts.
 
 ### Shell Functionality
-- Execute external Linux commands.
-- Built-in commands:
-  - `cd`
-  - `exit`
-  - `history`
-  - `jobs`
-  - `fg`
-  - `bg`
-  - `source`
-  - `multiWatch`
-- Display command exit status using `$?`.
-- Command history management.
+
+-   Execute external Linux commands.
+-   Built-in commands:
+    -   `cd`
+    -   `exit`
+    -   `history`
+    -   `jobs`
+    -   `fg`
+    -   `bg`
+    -   `source`
+    -   `multiWatch`
+-   Display the last command's exit status using `$?`.
+-   Persistent command history shared across tabs.
+-   Reverse incremental history search using `Ctrl+R`.
+-   Filename and directory autocomplete using `Tab`.
 
 ### Command Execution
-- Process creation and execution using `fork()` and `execvp()`.
-- Input and output redirection.
-- Command pipelines.
-- Support for background command execution using `&`.
+
+-   Process creation and execution using `fork()` and `execvp()`.
+-   Input and output redirection.
+-   Command pipelines.
+-   Background command execution using `&`.
+-   Multiline command support.
 
 ### Job Control
-- Suspend foreground commands using `Ctrl+Z`.
-- Interrupt foreground commands using `Ctrl+C`.
-- Execute commands in the background.
-- List background jobs using `jobs`.
-- Resume suspended jobs using `bg`.
-- Bring background jobs to the foreground using `fg`.
+
+-   Suspend foreground commands using `Ctrl+Z`.
+-   Interrupt foreground commands using `Ctrl+C`.
+-   Execute commands in the background.
+-   List background jobs using `jobs`.
+-   Resume suspended jobs using `bg`.
+-   Bring background jobs to the foreground using `fg`.
+
+### Execution Modes
+
+Terminator supports two execution modes:
+
+-   **Thread Mode (default):** Each terminal tab has a worker thread
+    that handles command/job servicing.
+-   **Process Mode:** Each terminal tab is handled by a separate child
+    process. The GUI parent communicates with tab processes using IPC.
+
+Both modes have been tested during project development.
 
 ## Technologies Used
 
-- **Programming Language:** C
-- **GUI Library:** X11
-- **System Calls:** `fork()`, `execvp()`, `waitpid()`, `pipe()`, `dup2()`, `kill()`
-- **Compiler:** GCC
-- **Build Tool:** GNU Make
-- **Platform:** Linux
+-   **Programming Language:** C
+-   **GUI Library:** X11
+-   **Concurrency:** POSIX threads (`pthread`)
+-   **Process and IPC APIs:** `fork()`, `execvp()`, `waitpid()`,
+    `pipe()`, `dup2()`, `socketpair()`, `mmap()`, and POSIX semaphores
+-   **Compiler:** GCC
+-   **Build environment:** Linux (including WSL with a working X11
+    display)
 
 ## Project Structure
 
-```text
+The source file and supporting files may be arranged as follows:
+
+``` text
 terminator/
-│
 ├── src/
 │   └── main.c
-│
 ├── README.md
 ├── Makefile
 ├── .gitignore
 └── LICENSE
 ```
 
+Adjust the paths above if your repository uses a different layout.
+
 ## Prerequisites
 
-Install GCC, Make, and the X11 development libraries.
+On Ubuntu / Debian, install GCC, Make, and the X11 development
+libraries:
 
-For Ubuntu / Debian:
-
-```bash
+``` bash
 sudo apt update
 sudo apt install build-essential libx11-dev
 ```
 
-A working X11 display environment is also required.
+A working X11 display environment is required. When using WSL, configure
+and start an X server/display environment supported by your WSL setup.
 
-## Compilation
+## Build
 
 Clone the repository:
 
-```bash
-git clone https://github.com/pavankumarpilaka26/terminator
+``` bash
+git clone https://github.com/pavankumarpilaka26/terminator.git
 cd terminator
 ```
 
-Compile the project:
+Compile directly with GCC (from the directory containing `main.c`):
 
-```bash
+``` bash
+gcc -std=c11 -Wall -Wextra -Wpedantic -Werror -O2 main.c -o terminator -lX11 -pthread
+```
+
+If the project includes a configured `Makefile`, you can instead build
+with:
+
+``` bash
 make
 ```
 
-Clean the generated executable:
+Remove the generated executable with:
 
-```bash
+``` bash
 make clean
 ```
 
-## Running the Application
+## Run
 
-After successful compilation:
+### Thread Mode (default)
 
-```bash
+``` bash
 ./terminator
+```
+
+### Process Mode
+
+``` bash
+./terminator useProcess=True
+```
+
+The equivalent option is:
+
+``` bash
+./terminator --process
 ```
 
 ## Example Commands
 
-Try the following commands inside Terminator:
+Try these commands inside Terminator:
 
-```bash
+``` bash
 pwd
 ls
 echo "Hello, Terminator!"
@@ -118,20 +163,33 @@ sleep 10 &
 jobs
 ```
 
-Foreground job control:
+### Job Control Example
 
-```bash
+Start a long-running foreground command:
+
+``` bash
 sleep 100
 ```
 
-Use `Ctrl+Z` to suspend the command, `bg` to resume it in the background, and `fg` to bring it back to the foreground. Use `Ctrl+C` to interrupt a foreground command.
+-   Press `Ctrl+Z` to suspend it.
+-   Run `bg` to resume it in the background.
+-   Run `fg` to bring it back to the foreground.
+-   Press `Ctrl+C` to interrupt a foreground command.
+
+### History and Autocomplete
+
+-   Press `Ctrl+R` and type text to search previously executed commands.
+-   Press `Tab` to complete a filename or directory. If there are
+    multiple matches, the terminal can display choices for selection.
 
 ## Project Status
 
-Tasks 1–8 have been implemented and tested as part of the project.
+**Tasks 1--10 have been implemented and tested** as part of the
+Computing Lab project. This includes terminal functionality, execution
+modes, command history/search, and filename autocomplete.
 
----
-
-**Terminator – A Custom Terminal Emulator**
+## Author
 
 Developed as part of the Computing Lab project.
+
+**Terminator -- A Custom Terminal Emulator**
