@@ -220,8 +220,7 @@ Additional files may be present depending on the checked-out branch or local dev
 - The custom X11 terminal interface is not intended to implement every feature or escape sequence of a full terminal standard.
 
 ## Project status
-
-The `task11-script-interpreter` branch contains the implementation for Tasks 1–11. The `main` branch is retained as the earlier Tasks 1–10 version until the final merge is explicitly approved.
+Project Has been completed sucessfully
 
 ## Author
 
