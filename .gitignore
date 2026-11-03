@@ -14,7 +14,16 @@
 # Windows metadata
 *:Zone.Identifier
 
-# Temporary test outputs
+# Backup source files
+*_backup*.c
+
+# Testing directory
+/terminator_test_tasks/
+
+# Temporary test files
+/apple.txt
+/application.txt
+/banana.txt
 /pavan.txt
 /sorted.txt
 /test.txt

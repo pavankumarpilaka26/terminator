@@ -1,14 +1,15 @@
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2
+CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2 -pthread
+LDFLAGS = -pthread
+LIBS = -lX11
 
 TARGET = terminator
 SOURCE = src/main.c
-LIBS = -lX11
 
 all: $(TARGET)
 
 $(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) $(SOURCE) -o $(TARGET) $(LIBS)
+	$(CC) $(CFLAGS) $(SOURCE) -o $(TARGET) $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -f $(TARGET)
