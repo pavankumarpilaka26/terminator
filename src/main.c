@@ -2255,7 +2255,27 @@ static int script_exec_range(TerminalTab *tab,ScriptContext *ctx,char lines[][IN
                 int body=branch+1, next=fi, e=-1,f=-1; (void)script_find_close(lines,count,branch,&e,&f);
                 if(e>=0&&e<fi)next=e;
                 int ok=0;
-                if(!strncmp(c,"if ",3)||!strncmp(c,"elif ",5)){ char expanded[INPUT_SIZE]; script_expand(tab,ctx,c+(c[0]=='i'?3:5),expanded,sizeof(expanded)); ok=script_test(tab,expanded); }
+                if (!strncmp(c, "if ", 3) || !strncmp(c, "elif ", 5)) {
+                    char expanded[INPUT_SIZE];
+                    script_expand(tab, ctx,
+                                  c + (c[0] == 'i' ? 3 : 5),
+                                  expanded, sizeof(expanded));
+
+                    /* Remove the optional inline shell separator and `then`.
+                       The test parser must receive only: [ expression ]. */
+                    char *semicolon = strchr(expanded, ';');
+                    if (semicolon != NULL) {
+                        *semicolon = '\0';
+                    } else {
+                        char *trimmed = script_trim(expanded);
+                        size_t condition_len = strlen(trimmed);
+                        if (condition_len >= 5 &&
+                            strcmp(trimmed + condition_len - 5, " then") == 0) {
+                            trimmed[condition_len - 5] = '\0';
+                        }
+                    }
+                    ok = script_test(tab, expanded);
+                }
                 else if(!strcmp(c,"else"))ok=1;
                 if(ok&&!taken){ script_exec_range(tab,ctx,lines,count,body,next,path); taken=1; }
                 if(next==fi)break;
