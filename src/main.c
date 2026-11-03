@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -33,6 +34,7 @@
 #define MAX_ARGS 128
 #define MAX_HISTORY 10000
 #define MAX_WATCH_COMMANDS 16
+#define MAX_BACKGROUND_JOBS 16
 
 #define WINDOW_WIDTH 900
 #define WINDOW_HEIGHT 600
@@ -99,7 +101,8 @@ typedef struct {
     int previous_backslash_continuation;
     char cwd[PATH_MAX];
     ActiveCommand command;
-    ActiveCommand background_command;
+    ActiveCommand background_command; /* Process-mode UI summary only. */
+    ActiveCommand background_jobs[MAX_BACKGROUND_JOBS];
     MultiWatch watch;
     int scroll_offset;
     int last_status;
@@ -134,6 +137,7 @@ static Display *display;
 static Window window;
 static GC gc;
 static XFontStruct *font;
+static unsigned long prompt_color;
 static Atom wm_delete;
 static Atom clipboard_atom;
 static Atom utf8_atom;
@@ -239,6 +243,11 @@ static int parse_binding(const char *value, KeyBinding *out)
             if (candidate == NoSymbol && strlen(token) == 1)
                 candidate = (KeySym)(unsigned char)token[0];
             if (candidate == NoSymbol || key != NoSymbol) return 0;
+            /* XLookupKeysym(event, 0) returns the unshifted keysym for
+               alphabetic keys (for example XK_q), even when the config
+               spells the key as Ctrl+Q (XK_Q). Normalize A-Z to a-z. */
+            if (candidate >= XK_A && candidate <= XK_Z)
+                candidate = candidate - XK_A + XK_a;
             key = candidate;
         }
         token = strtok_r(NULL, "+", &save);
@@ -274,7 +283,13 @@ static void load_key_bindings(void)
         *eq++ = '\0';
         char *name = line;
         while (*name == ' ' || *name == '\t') name++;
+        char *name_end = name + strlen(name);
+        while (name_end > name && (name_end[-1] == ' ' || name_end[-1] == '\t'))
+            *--name_end = '\0';
         while (*eq == ' ' || *eq == '\t') eq++;
+        char *value_end = eq + strlen(eq);
+        while (value_end > eq && (value_end[-1] == ' ' || value_end[-1] == '\t'))
+            *--value_end = '\0';
         KeyBinding *target = NULL;
         if (!strcmp(name,"ctrl_a")) target=&binding_ctrl_a;
         else if (!strcmp(name,"ctrl_e")) target=&binding_ctrl_e;
@@ -443,12 +458,12 @@ static void draw_selection_segment(int y, const char *text, int from, int to)
     if (to <= from) return;
     int x1 = LEFT_MARGIN + XTextWidth(font, text, from);
     int x2 = LEFT_MARGIN + XTextWidth(font, text, to);
-    XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
+    XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
     XFillRectangle(display, window, gc, x1, y - 15,
                    (unsigned int)(x2 - x1), (unsigned int)LINE_HEIGHT);
-    XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
-    XDrawString(display, window, gc, x1, y, text + from, to - from);
     XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
+    XDrawString(display, window, gc, x1, y, text + from, to - from);
+    XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
 }
 
 static void draw_text_selection(TerminalTab *tab, int start, int y_first)
@@ -478,12 +493,12 @@ static void draw_text_selection(TerminalTab *tab, int start, int y_first)
             if (from < len && to > from) {
                 int x1 = LEFT_MARGIN + prompt_width + XTextWidth(font, tab->input, from);
                 int x2 = LEFT_MARGIN + prompt_width + XTextWidth(font, tab->input, to);
-                XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
+                XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
                 XFillRectangle(display, window, gc, x1, y - 15,
                                (unsigned int)(x2 - x1), (unsigned int)LINE_HEIGHT);
-                XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
-                XDrawString(display, window, gc, x1, y, tab->input + from, to - from);
                 XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
+                XDrawString(display, window, gc, x1, y, tab->input + from, to - from);
+                XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
             }
             continue;
         }
@@ -694,6 +709,14 @@ static void update_reverse_search(TerminalTab *tab)
 static void history_add(const char *command)
 {
     if (command == NULL || command[0] == '\0')
+        return;
+
+    /* Do not add the history built-in itself to the command history. */
+    const char *first = command;
+    while (*first != '\0' && isspace((unsigned char)*first))
+        ++first;
+    if (strncmp(first, "history", 7) == 0 &&
+        (first[7] == '\0' || isspace((unsigned char)first[7]) || first[7] == '|'))
         return;
 
     history_lock();
@@ -989,6 +1012,22 @@ static int change_directory(TerminalTab *tab, const char *path)
     return 0;
 }
 
+/* Background jobs are stored in stable numbered slots (slot + 1). */
+static int has_background_jobs(const TerminalTab *tab)
+{
+    if (tab->background_command.active) return 1; /* GUI summary in Process Mode. */
+    for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i)
+        if (tab->background_jobs[i].active) return 1;
+    return 0;
+}
+
+static int find_free_background_slot(const TerminalTab *tab)
+{
+    for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i)
+        if (!tab->background_jobs[i].active) return i;
+    return -1;
+}
+
 /* ---------- Tab initialization and cleanup ---------- */
 
 static void init_tab(TerminalTab *tab)
@@ -999,6 +1038,10 @@ static void init_tab(TerminalTab *tab)
     tab->command.output_fd = -1;
     tab->background_command.pid = -1;
     tab->background_command.output_fd = -1;
+    for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i) {
+        tab->background_jobs[i].pid = -1;
+        tab->background_jobs[i].output_fd = -1;
+    }
     tab->process_fd = -1;
     tab->process_pid = -1;
     tab->last_status = 0;
@@ -1025,6 +1068,8 @@ static void stop_tab_command(TerminalTab *tab)
     stop_multiwatch(tab);
     stop_one_command(&tab->command);
     stop_one_command(&tab->background_command);
+    for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i)
+        stop_one_command(&tab->background_jobs[i]);
 }
 
 static void process_child_loop(int index, int fd)
@@ -1075,10 +1120,16 @@ static void process_child_loop(int index, int fd)
         state.status = tab->last_status;
         state.flags = (tab->command.active ? 1 : 0) |
                       (tab->command.stopped ? 2 : 0) |
-                      (tab->background_command.active ? 4 : 0) |
+                      (has_background_jobs(tab) ? 4 : 0) |
                       (tab->watch.active ? 8 : 0);
         state.command_pid = tab->command.pid;
-        state.background_pid = tab->background_command.pid;
+        state.background_pid = -1;
+        for (int j = 0; j < MAX_BACKGROUND_JOBS; ++j) {
+            if (tab->background_jobs[j].active) {
+                state.background_pid = tab->background_jobs[j].pid;
+                break;
+            }
+        }
         snprintf(state.cwd, sizeof(state.cwd), "%s", tab->cwd);
         if (process_send(fd, &state) == -1) alive = 0;
     }
@@ -1115,6 +1166,10 @@ static int start_process_tab(int index)
     tabs[index].process_fd = pair[0];
     tabs[index].command.pid = -1;
     tabs[index].background_command.pid = -1;
+    for (int j = 0; j < MAX_BACKGROUND_JOBS; ++j) {
+        tabs[index].background_jobs[j].pid = -1;
+        tabs[index].background_jobs[j].output_fd = -1;
+    }
     return 0;
 }
 
@@ -1219,11 +1274,15 @@ static void close_tab(int index)
 
     /* Stop the closing tab's jobs now, before allowing its worker to exit. */
     TerminalTab *closing = &tabs[index];
-    ActiveCommand *jobs[2] = {&closing->command, &closing->background_command};
-    for (int j = 0; j < 2; ++j) {
-        if (jobs[j]->active && jobs[j]->pid > 0) {
-            (void)kill(-jobs[j]->pid, SIGTERM);
-            (void)kill(jobs[j]->pid, SIGTERM);
+    if (closing->command.active && closing->command.pid > 0) {
+        (void)kill(-closing->command.pid, SIGTERM);
+        (void)kill(closing->command.pid, SIGTERM);
+    }
+    for (int j = 0; j < MAX_BACKGROUND_JOBS; ++j) {
+        ActiveCommand *job = &closing->background_jobs[j];
+        if (job->active && job->pid > 0) {
+            (void)kill(-job->pid, SIGTERM);
+            (void)kill(job->pid, SIGTERM);
         }
     }
     stop_multiwatch(closing);
@@ -1656,7 +1715,6 @@ static void stop_multiwatch(TerminalTab *tab)
     }
     mw->active = 0;
     mw->count = 0;
-    add_line(&tab->buffer, "multiWatch stopped (Ctrl+C).");
     tab->last_status = 130;
 }
 
@@ -1723,14 +1781,13 @@ static void start_multiwatch(TerminalTab *tab, const char *original)
         tab->last_status = 2;
         return;
     }
-    if (tab->command.active || tab->background_command.active || tab->watch.active) {
+    if (tab->command.active || has_background_jobs(tab) || tab->watch.active) {
         add_line(&tab->buffer, "A command or multiWatch is already running in this tab.");
         tab->last_status = 1;
         return;
     }
     tab->watch = parsed;
     tab->watch.active = 1;
-    add_line(&tab->buffer, "multiWatch started. Press Ctrl+C to stop watched commands.");
     for (int i = 0; i < tab->watch.count; ++i)
         (void)launch_watch_command(tab, &tab->watch.commands[i]);
     tab->last_status = 0;
@@ -1783,11 +1840,6 @@ static void service_multiwatch(TerminalTab *tab)
         }
         if (wc->active && wc->pipe_eof && wc->child_reaped) {
             watch_flush_partial(tab, wc);
-            add_line(&tab->buffer, WATCH_SEPARATOR);
-            char status_line[LINE_SIZE];
-            snprintf(status_line, sizeof(status_line), "[%.900s completed; exit status %d]",
-                     wc->text, wc->exit_status);
-            add_line(&tab->buffer, status_line);
             add_line(&tab->buffer, WATCH_SEPARATOR);
             wc->active = 0;
             wc->pid = -1;
@@ -1952,15 +2004,18 @@ static int extract_background_operator(char *command)
 static void promote_background_command(TerminalTab *tab)
 {
     if (!tab->command.active) return;
-    if (tab->background_command.active) {
-        add_line(&tab->buffer, "A background job is already active in this tab.");
-        (void)kill(-tab->command.pid, SIGTERM); (void)kill(tab->command.pid, SIGTERM);
+    int slot = find_free_background_slot(tab);
+    if (slot < 0) {
+        add_line(&tab->buffer, "Maximum background jobs reached in this tab.");
+        (void)kill(-tab->command.pid, SIGTERM);
+        (void)kill(tab->command.pid, SIGTERM);
         return;
     }
     tab->command.background = 1;
-    tab->background_command = tab->command;
+    tab->background_jobs[slot] = tab->command;
     memset(&tab->command, 0, sizeof(tab->command));
-    tab->command.pid = -1; tab->command.output_fd = -1;
+    tab->command.pid = -1;
+    tab->command.output_fd = -1;
 }
 
 static void start_command(TerminalTab *tab, const char *original_command)
@@ -1991,8 +2046,8 @@ static void start_command(TerminalTab *tab, const char *original_command)
         start_bash_command(tab, original_command, expanded);
         if (run_in_background && tab->command.active) {
             char message[LINE_SIZE];
-            snprintf(message, sizeof(message), "[1] %ld started in background",
-                     (long)tab->command.pid);
+            snprintf(message, sizeof(message), "[%d] %ld started in background",
+                     find_free_background_slot(tab) + 1, (long)tab->command.pid);
             add_line(&tab->buffer, message);
             promote_background_command(tab);
         }
@@ -2003,8 +2058,8 @@ static void start_command(TerminalTab *tab, const char *original_command)
         start_pipeline(tab, original_command, expanded);
         if (run_in_background && tab->command.active) {
             char message[LINE_SIZE];
-            snprintf(message, sizeof(message), "[1] %ld started in background",
-                     (long)tab->command.pid);
+            snprintf(message, sizeof(message), "[%d] %ld started in background",
+                     find_free_background_slot(tab) + 1, (long)tab->command.pid);
             add_line(&tab->buffer, message);
             promote_background_command(tab);
         }
@@ -2099,65 +2154,100 @@ static void start_command(TerminalTab *tab, const char *original_command)
         return;
     }
 
-    /* Job-control commands operate on the current tab's active process group.
-       Commands remain asynchronously serviced so the X11 event loop stays live. */
+    /* Job-control commands operate on jobs owned by this tab. */
     if (strcmp(argv[0], "jobs") == 0) {
         int found = 0;
-        ActiveCommand *list[2] = {&tab->command, &tab->background_command};
-        for (int k = 0; k < 2; ++k) if (list[k]->active) {
-            ActiveCommand *job = list[k]; char message[LINE_SIZE];
-            int job_number = (tab->command.active && tab->background_command.active) ? k + 1 : 1;
-            snprintf(message, sizeof(message), "[%d] %s: %.900s", job_number,
-                     job->stopped ? "stopped" :
-                     (job->background ? "running (background)" : "running"),
+        if (tab->command.active) {
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "[1] %s: %.900s",
+                     tab->command.stopped ? "stopped" : "running",
+                     tab->command.command_text);
+            add_line(&tab->buffer, message);
+            found = 1;
+        }
+        for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i) {
+            ActiveCommand *job = &tab->background_jobs[i];
+            if (!job->active) continue;
+            char message[LINE_SIZE];
+            snprintf(message, sizeof(message), "[%d] %s: %.900s", i + 1,
+                     job->stopped ? "stopped" : "running (background)",
                      job->command_text);
-            add_line(&tab->buffer, message); found = 1;
+            add_line(&tab->buffer, message);
+            found = 1;
         }
         if (!found) add_line(&tab->buffer, "No running or stopped jobs in this tab.");
-        tab->last_status = 0; return;
+        tab->last_status = 0;
+        return;
     }
     if (strcmp(argv[0], "fg") == 0 || strcmp(argv[0], "bg") == 0) {
         int to_bg = strcmp(argv[0], "bg") == 0;
-        if (argc > 2 || (argc == 2 && strcmp(argv[1], "%1") != 0 &&
-                          strcmp(argv[1], "1") != 0)) {
-            add_line(&tab->buffer, to_bg ? "bg: usage: bg [%1]" : "fg: usage: fg [%1]");
-            tab->last_status = 2; return;
+        int slot = -1;
+        if (argc > 2) {
+            add_line(&tab->buffer, to_bg ? "bg: usage: bg [%job]" : "fg: usage: fg [%job]");
+            tab->last_status = 2;
+            return;
         }
-        ActiveCommand *job = tab->background_command.active ?
-                             &tab->background_command : &tab->command;
-        if (!job->active || job->pid <= 0) {
-            add_line(&tab->buffer, to_bg ? "bg: no current job" : "fg: no current job");
-            tab->last_status = 1; return;
+        if (argc == 2) {
+            const char *id = argv[1];
+            if (*id == '%') ++id;
+            char *tail = NULL;
+            long number = strtol(id, &tail, 10);
+            if (!*id || !tail || *tail || number < 1 || number > MAX_BACKGROUND_JOBS) {
+                add_line(&tab->buffer, to_bg ? "bg: invalid job number" : "fg: invalid job number");
+                tab->last_status = 2;
+                return;
+            }
+            slot = (int)number - 1;
+            if (slot == 0 && !tab->background_jobs[0].active &&
+                tab->command.active && tab->command.stopped)
+                slot = -2;
+        } else {
+            for (int i = MAX_BACKGROUND_JOBS - 1; i >= 0; --i) {
+                if (tab->background_jobs[i].active) { slot = i; break; }
+            }
+            if (slot < 0 && tab->command.active && tab->command.stopped) slot = -2;
+        }
+        ActiveCommand *job = slot == -2 ? &tab->command :
+                             (slot >= 0 ? &tab->background_jobs[slot] : NULL);
+        if (!job || !job->active || job->pid <= 0) {
+            add_line(&tab->buffer, to_bg ? "bg: no such job" : "fg: no such job");
+            tab->last_status = 1;
+            return;
+        }
+        if (!to_bg && tab->command.active && job != &tab->command) {
+            add_line(&tab->buffer, "fg: a foreground command is already running");
+            tab->last_status = 1;
+            return;
         }
         if (job->stopped && kill(-job->pid, SIGCONT) == -1 && kill(job->pid, SIGCONT) == -1) {
             add_format(&tab->buffer, to_bg ? "bg: %s" : "fg: %s", strerror(errno));
-            tab->last_status = 1; return;
+            tab->last_status = 1;
+            return;
         }
         job->stopped = 0;
         if (to_bg) {
             if (job == &tab->command) {
-                if (tab->background_command.active) {
-                    add_line(&tab->buffer, "bg: a background job is already active");
-                    tab->last_status = 1; return;
+                int free_slot = find_free_background_slot(tab);
+                if (free_slot < 0) {
+                    add_line(&tab->buffer, "bg: maximum background jobs reached");
+                    tab->last_status = 1;
+                    return;
                 }
-                tab->background_command = *job;
+                tab->background_jobs[free_slot] = *job;
                 memset(job, 0, sizeof(*job)); job->pid = -1; job->output_fd = -1;
+                slot = free_slot;
+                job = &tab->background_jobs[slot];
             }
-            tab->background_command.background = 1;
-            add_line(&tab->buffer, "[1] continued in background.");
+            job->background = 1;
+            { char msg[LINE_SIZE]; snprintf(msg, sizeof(msg), "[%d] continued in background.", slot + 1); add_line(&tab->buffer, msg); }
         } else {
-            if (job == &tab->background_command) {
-                if (tab->command.active) {
-                    add_line(&tab->buffer, "fg: a foreground command is already running");
-                    tab->last_status = 1; return;
-                }
-                tab->command = *job;
-                memset(job, 0, sizeof(*job)); job->pid = -1; job->output_fd = -1;
-            }
+            tab->command = *job;
+            memset(job, 0, sizeof(*job)); job->pid = -1; job->output_fd = -1;
             tab->command.background = 0;
-            add_line(&tab->buffer, "[1] continued in foreground.");
+            { char msg[LINE_SIZE]; snprintf(msg, sizeof(msg), "[%d] continued in foreground.", slot + 1); add_line(&tab->buffer, msg); }
         }
-        tab->last_status = 0; return;
+        tab->last_status = 0;
+        return;
     }
 
     if (strcmp(argv[0], "source") == 0 || strcmp(argv[0], ".") == 0) {
@@ -2349,8 +2439,8 @@ static void start_command(TerminalTab *tab, const char *original_command)
              sizeof(tab->command.command_text), "%s", original_command);
     if (run_in_background) {
         char message[LINE_SIZE];
-        snprintf(message, sizeof(message), "[1] %ld started in background",
-                 (long)pid);
+        snprintf(message, sizeof(message), "[%d] %ld started in background",
+                 find_free_background_slot(tab) + 1, (long)pid);
         add_line(&tab->buffer, message);
         promote_background_command(tab);
     }
@@ -2383,16 +2473,22 @@ static void service_one_command(TerminalTab *tab, ActiveCommand *cmd, int backgr
     if (cmd->pipe_eof && cmd->child_reaped) {
         flush_partial_output(tab,cmd);
         if (!background) tab->last_status=cmd->exit_status;
-        char msg[LINE_SIZE];
-        snprintf(msg,sizeof(msg),"[%s completed; exit status %d]",background?"background job":"command",cmd->exit_status);
-        add_line(&tab->buffer,msg); cmd->active=0; cmd->pid=-1;
+        if (background) {
+            char msg[LINE_SIZE];
+            snprintf(msg, sizeof(msg),
+                     "[background job completed; exit status %d]",
+                     cmd->exit_status);
+            add_line(&tab->buffer, msg);
+        }
+        cmd->active=0; cmd->pid=-1;
         if (cmd->output_fd>=0) { close(cmd->output_fd); cmd->output_fd=-1; }
     }
 }
 static void service_tab(TerminalTab *tab)
 {
     service_one_command(tab,&tab->command,0);
-    service_one_command(tab,&tab->background_command,1);
+    for (int i = 0; i < MAX_BACKGROUND_JOBS; ++i)
+        service_one_command(tab, &tab->background_jobs[i], 1);
 }
 
 /* Worker threads never call Xlib.  They own command launch and job servicing. */
@@ -2581,31 +2677,40 @@ static void draw_window(void)
 {
     XClearWindow(display, window);
 
-    int x = 10;
+    /* Divide the header evenly so all nine tabs remain visible. */
+    int tab_area_width = window_width - 20;
+    int tab_cell_width = tab_count > 0 ? tab_area_width / tab_count : tab_area_width;
 
     for (int i = 0; i < tab_count; i++) {
         const char *base = strrchr(tabs[i].cwd, '/');
-
         if (base != NULL && base[1] != '\0')
             base++;
         else
             base = "/";
 
+        const char *status =
+            (tabs[i].command.active || has_background_jobs(&tabs[i]) || tabs[i].watch.active)
+                ? (tabs[i].command.stopped ? " (stopped)" : " (running)") : "";
         char label[160];
-        snprintf(label, sizeof(label), "[%c %d: %.60s%s]",
-                 i == active_tab ? '*' : ' ',
-                 i + 1, base,
-                 (tabs[i].command.active || tabs[i].background_command.active || tabs[i].watch.active) ?
-                     (tabs[i].command.stopped ? " (stopped)" : " (running)") : "");
+        snprintf(label, sizeof(label), "[%c%d:%s%s]",
+                 i == active_tab ? '*' : ' ', i + 1, base, status);
 
-        XDrawString(display, window, gc, x, 19,
-                    label, (int)strlen(label));
-        x += (int)strlen(label) * 8 + 10;
+        int max_text_width = tab_cell_width - 8;
+        size_t label_len = strlen(label);
+        while (label_len > 0 && XTextWidth(font, label, (int)label_len) > max_text_width) {
+            /* Keep the tab number and active marker; shorten the directory/status text. */
+            if (label_len > 5) {
+                label[label_len - 2] = ']';
+                label[label_len - 1] = '\0';
+                label_len--;
+            } else {
+                break;
+            }
+        }
+
+        int tab_x = 10 + i * tab_cell_width;
+        XDrawString(display, window, gc, tab_x, 19, label, (int)label_len);
     }
-
-    XDrawString(display, window, gc, x, 19,
-                "Ctrl+T new | Ctrl+W close | Ctrl+1..9 switch",
-                44);
 
     TerminalTab *tab = &tabs[active_tab];
 
@@ -2637,9 +2742,21 @@ static void draw_window(void)
     for (int i = start;
          i < tab->buffer.count && y < window_height - LINE_HEIGHT;
          i++, y += LINE_HEIGHT) {
-        XDrawString(display, window, gc, LEFT_MARGIN, y,
-                    tab->buffer.lines[i],
-                    (int)strlen(tab->buffer.lines[i]));
+        const char *line = tab->buffer.lines[i];
+        if (strncmp(line, PROMPT, strlen(PROMPT)) == 0) {
+            const char *user_part = "user@terminator";
+            const char *suffix_and_command = line + strlen(user_part);
+            int user_width = XTextWidth(font, user_part, (int)strlen(user_part));
+            XSetForeground(display, gc, prompt_color);
+            XDrawString(display, window, gc, LEFT_MARGIN, y,
+                        user_part, (int)strlen(user_part));
+            XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
+            XDrawString(display, window, gc, LEFT_MARGIN + user_width, y,
+                        suffix_and_command, (int)strlen(suffix_and_command));
+        } else {
+            XDrawString(display, window, gc, LEFT_MARGIN, y,
+                        line, (int)strlen(line));
+        }
     }
 
     if ((!tab->command.active || tab->command.stopped || tab->command.background) && !tab->watch.active) {
@@ -2648,8 +2765,8 @@ static void draw_window(void)
             int bar_height = LINE_HEIGHT * 3 + 10;
             int bar_y = window_height - bar_height;
             if (bar_y < HEADER_HEIGHT) bar_y = HEADER_HEIGHT;
-            unsigned long foreground = BlackPixel(display, DefaultScreen(display));
-            unsigned long background = WhitePixel(display, DefaultScreen(display));
+            unsigned long foreground = WhitePixel(display, DefaultScreen(display));
+            unsigned long background = BlackPixel(display, DefaultScreen(display));
 
             XSetForeground(display, gc, background);
             XFillRectangle(display, window, gc, 0, bar_y,
@@ -2690,9 +2807,22 @@ static void draw_window(void)
             if (y > window_height - 5)
                 y = window_height - 5;
             const char *visible_prompt = tab->continuation_mode ? "> " : PROMPT;
-            XDrawString(display, window, gc, LEFT_MARGIN, y,
-                        visible_prompt, (int)strlen(visible_prompt));
             int prompt_width = XTextWidth(font, visible_prompt, (int)strlen(visible_prompt));
+            if (tab->continuation_mode) {
+                XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
+                XDrawString(display, window, gc, LEFT_MARGIN, y,
+                            visible_prompt, (int)strlen(visible_prompt));
+            } else {
+                const char *user_part = "user@terminator";
+                const char *prompt_suffix = "> ";
+                int user_width = XTextWidth(font, user_part, (int)strlen(user_part));
+                XSetForeground(display, gc, prompt_color);
+                XDrawString(display, window, gc, LEFT_MARGIN, y,
+                            user_part, (int)strlen(user_part));
+                XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
+                XDrawString(display, window, gc, LEFT_MARGIN + user_width, y,
+                            prompt_suffix, (int)strlen(prompt_suffix));
+            }
             int input_x = LEFT_MARGIN + prompt_width;
             int available_width = window_width - input_x - LEFT_MARGIN;
             if (available_width > 0) {
@@ -3253,6 +3383,10 @@ static void handle_key(XKeyEvent *event)
 
 int main(int argc, char **argv)
 {
+    /* Use Indian Standard Time for external commands and local timestamps. */
+    if (setenv("TZ", "Asia/Kolkata", 1) == 0)
+        tzset();
+
     process_mode = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "useProcess=True") == 0 || strcmp(argv[i], "--process") == 0)
@@ -3286,8 +3420,8 @@ int main(int argc, char **argv)
     window = XCreateSimpleWindow(
         display, root, 100, 100,
         WINDOW_WIDTH, WINDOW_HEIGHT, 1,
-        BlackPixel(display, screen),
-        WhitePixel(display, screen));
+        WhitePixel(display, screen),
+        BlackPixel(display, screen));
 
     XStoreName(display, window, "Terminator - Custom Terminal");
 
@@ -3310,6 +3444,16 @@ int main(int argc, char **argv)
         XDestroyWindow(display, window);
         XCloseDisplay(display);
         return EXIT_FAILURE;
+    }
+
+    XSetForeground(display, gc, WhitePixel(display, screen));
+    XColor green_exact;
+    XColor green_color;
+    if (XAllocNamedColor(display, DefaultColormap(display, screen),
+                         "#00FF00", &green_color, &green_exact)) {
+        prompt_color = green_color.pixel;
+    } else {
+        prompt_color = WhitePixel(display, screen);
     }
 
     font = XLoadQueryFont(display, "fixed");
