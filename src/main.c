@@ -2109,6 +2109,221 @@ static void promote_background_command(TerminalTab *tab)
     tab->command.output_fd = -1;
 }
 
+
+/* ---------------- Task 11: small in-process shell-script interpreter ---------------- */
+#define SCRIPT_MAX_LINES 512
+#define SCRIPT_MAX_VARS 64
+#define SCRIPT_VALUE 512
+
+typedef struct { char name[64]; char value[SCRIPT_VALUE]; } ScriptVar;
+typedef struct {
+    ScriptVar vars[SCRIPT_MAX_VARS]; int var_count;
+    char *args[MAX_ARGS]; int argc;
+    int exit_requested; int exit_status;
+} ScriptContext;
+
+static void script_set_var(ScriptContext *ctx, const char *name, const char *value)
+{
+    for (int i=0;i<ctx->var_count;i++) if (!strcmp(ctx->vars[i].name,name)) {
+        snprintf(ctx->vars[i].value,sizeof(ctx->vars[i].value),"%s",value); return;
+    }
+    if (ctx->var_count < SCRIPT_MAX_VARS) {
+        ScriptVar *v=&ctx->vars[ctx->var_count++];
+        snprintf(v->name,sizeof(v->name),"%.63s",name);
+        snprintf(v->value,sizeof(v->value),"%s",value);
+    }
+}
+static const char *script_get_var(ScriptContext *ctx,const char *name)
+{
+    for(int i=0;i<ctx->var_count;i++) if(!strcmp(ctx->vars[i].name,name)) return ctx->vars[i].value;
+    return "";
+}
+static void script_expand(TerminalTab *tab, ScriptContext *ctx, const char *src,
+                          char *dst,size_t cap)
+{
+    size_t o=0;
+    for(size_t i=0;src[i] && o+1<cap;){
+        if(src[i]=='$'){
+            char key[64]={0}; size_t k=0; const char *val=NULL; i++;
+            if(src[i]=='?'){ snprintf(key,sizeof(key),"%d",tab->last_status); val=key; i++; }
+            else if(src[i]=='#'){ snprintf(key,sizeof(key),"%d",ctx->argc); val=key; i++; }
+            else if(src[i]=='$'){ snprintf(key,sizeof(key),"%ld",(long)getpid()); val=key; i++; }
+            else if(isdigit((unsigned char)src[i])){ int n=src[i++]-'0'; val=(n>0&&n<=ctx->argc)?ctx->args[n-1]:""; }
+            else if(src[i]=='{') { i++; while(src[i] && src[i]!='}' && k+1<sizeof(key)) key[k++]=src[i++]; if(src[i]=='}')i++; val=script_get_var(ctx,key); }
+            else if(isalpha((unsigned char)src[i])||src[i]=='_') { while((isalnum((unsigned char)src[i])||src[i]=='_')&&k+1<sizeof(key)) key[k++]=src[i++]; val=script_get_var(ctx,key); }
+            else { if(o+1<cap)dst[o++]='$'; continue; }
+            for(size_t j=0;val && val[j] && o+1<cap;j++) dst[o++]=val[j];
+        } else dst[o++]=src[i++];
+    }
+    dst[o]='\0';
+}
+static char *script_trim(char *s)
+{
+    while(isspace((unsigned char)*s))s++;
+    size_t n=strlen(s); while(n&&isspace((unsigned char)s[n-1]))s[--n]='\0'; return s;
+}
+static int script_test(TerminalTab *tab, char *expr)
+{
+    char copy[INPUT_SIZE]; snprintf(copy,sizeof(copy),"%s",expr);
+    char *a[8]; int n=0; char *p=copy;
+    /* Tokenize test expressions and remove simple surrounding quotes. */
+    while (*p && n < 8) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        char *start = p; char quote = '\0';
+        while (*p) {
+            if (quote) { if (*p == quote) quote = '\0'; p++; continue; }
+            if (*p == '\'' || *p == '\"') { quote = *p++; continue; }
+            if (isspace((unsigned char)*p)) break;
+            p++;
+        }
+        if (*p) *p++ = '\0';
+        /* Compact away quote characters in this token. */
+        char *r = start, *w = start; quote = '\0';
+        while (*r) {
+            if (!quote && (*r == '\'' || *r == '\"')) { quote = *r++; continue; }
+            if (quote && *r == quote) { quote = '\0'; r++; continue; }
+            *w++ = *r++;
+        }
+        *w = '\0'; a[n++] = start;
+    }
+    if(n&&(!strcmp(a[0],"[")||!strcmp(a[0],"test"))){
+        if(!strcmp(a[0],"[")){ if(n<2||strcmp(a[n-1],"]"))return 0; n--; }
+        for(int i=0;i<n;i++) a[i]=a[i];
+        if(n==2){ if(!strcmp(a[1],"-n"))return 0; if(!strcmp(a[1],"-z"))return 1; return a[1][0]!=0; }
+        if(n==3){
+            struct stat st; char testpath[PATH_MAX]; const char *p=a[2];
+            if((!strcmp(a[1],"-f")||!strcmp(a[1],"-d")) && p[0]!='/'){
+                if(snprintf(testpath,sizeof(testpath),"%s/%s",tab->cwd,p)>=(int)sizeof(testpath))return 0;
+                p=testpath;
+            }
+            if(!strcmp(a[1],"-f"))return stat(p,&st)==0&&S_ISREG(st.st_mode);
+            if(!strcmp(a[1],"-d"))return stat(p,&st)==0&&S_ISDIR(st.st_mode);
+            if(!strcmp(a[1],"-n"))return a[2][0]!=0;
+            if(!strcmp(a[1],"-z"))return a[2][0]==0;
+        }
+        if(n==4){ if(!strcmp(a[2],"=")||!strcmp(a[2],"=="))return !strcmp(a[1],a[3]); if(!strcmp(a[2],"!="))return strcmp(a[1],a[3])!=0;
+            char *e1=NULL,*e2=NULL; long x=strtol(a[1],&e1,10),y=strtol(a[3],&e2,10); if(!*e1&&!*e2){ if(!strcmp(a[2],"-eq"))return x==y; if(!strcmp(a[2],"-ne"))return x!=y; if(!strcmp(a[2],"-gt"))return x>y; if(!strcmp(a[2],"-lt"))return x<y; if(!strcmp(a[2],"-ge"))return x>=y; if(!strcmp(a[2],"-le"))return x<=y; }
+        }
+    }
+    (void)tab; return 0;
+}
+static int script_find_close(char lines[][INPUT_SIZE],int count,int from,int *elseidx,int *fiidx)
+{
+    int depth=0; *elseidx=-1; *fiidx=-1;
+    for(int i=from+1;i<count;i++){
+        char tmp[INPUT_SIZE]; snprintf(tmp,sizeof(tmp),"%s",lines[i]); char *s=script_trim(tmp);
+        if(!strncmp(s,"if ",3))depth++;
+        else if(!strcmp(s,"fi")){ if(depth==0){*fiidx=i;return 0;} depth--; }
+        else if(depth==0&&(!strncmp(s,"elif ",5)||!strcmp(s,"else"))){ if(*elseidx<0)*elseidx=i; }
+    }
+    return -1;
+}
+static int script_capture_substitution(const char *value, char *out, size_t out_size)
+{
+    size_t n = strlen(value);
+    if (n < 3 || value[0] != '$' || value[1] != '(' || value[n-1] != ')') return 0;
+    char command[INPUT_SIZE];
+    size_t command_len = n - 3;
+    if (command_len >= sizeof(command)) return -1;
+    memcpy(command, value + 2, command_len);
+    command[command_len] = '\0';
+    FILE *pipe = popen(command, "r");
+    if (!pipe) return -1;
+    size_t used = 0;
+    while (used + 1 < out_size) {
+        size_t got = fread(out + used, 1, out_size - used - 1, pipe);
+        used += got;
+        if (got == 0) break;
+    }
+    out[used] = '\0';
+    int status = pclose(pipe);
+    while (used && (out[used-1] == '\n' || out[used-1] == '\r')) out[--used] = '\0';
+    return status == -1 ? -1 : 1;
+}
+
+static int script_exec_range(TerminalTab *tab,ScriptContext *ctx,char lines[][INPUT_SIZE],int count,int begin,int end,const char *path)
+{
+    for(int i=begin;i<end&&!ctx->exit_requested;i++){
+        char raw[INPUT_SIZE]; snprintf(raw,sizeof(raw),"%s",lines[i]); char *line=script_trim(raw);
+        if(!*line||*line=='#')continue;
+        if(!strncmp(line,"if ",3)){
+            int els=-1,fi=-1; if(script_find_close(lines,count,i,&els,&fi)!=0||fi<0||fi>=end){ char msg[LINE_SIZE]; snprintf(msg,sizeof(msg),"%s:%d: syntax error: missing fi",path,i+1); add_line(&tab->buffer,msg); return 2; }
+            int branch=i; int taken=0;
+            while(branch<fi){
+                char condline[INPUT_SIZE]; snprintf(condline,sizeof(condline),"%s",lines[branch]); char *c=script_trim(condline);
+                int body=branch+1, next=fi, e=-1,f=-1; (void)script_find_close(lines,count,branch,&e,&f);
+                if(e>=0&&e<fi)next=e;
+                int ok=0;
+                if(!strncmp(c,"if ",3)||!strncmp(c,"elif ",5)){ char expanded[INPUT_SIZE]; script_expand(tab,ctx,c+(c[0]=='i'?3:5),expanded,sizeof(expanded)); ok=script_test(tab,expanded); }
+                else if(!strcmp(c,"else"))ok=1;
+                if(ok&&!taken){ script_exec_range(tab,ctx,lines,count,body,next,path); taken=1; }
+                if(next==fi)break;
+                branch=next;
+                if(!strncmp(script_trim(lines[branch]),"elif ",5)||!strcmp(script_trim(lines[branch]),"else"))continue;
+                break;
+            }
+            i=fi; continue;
+        }
+        if(!strcmp(line,"fi")||!strcmp(line,"then")||!strcmp(line,"else")||!strncmp(line,"elif ",5))continue;
+        if(!strncmp(line,"exit",4)&&(line[4]=='\0'||isspace((unsigned char)line[4]))){ char *p=script_trim(line+4); ctx->exit_status=*p?atoi(p):tab->last_status; ctx->exit_requested=1; break; }
+        char expanded[INPUT_SIZE]; script_expand(tab,ctx,line,expanded,sizeof(expanded));
+        /* Simple NAME=value assignments are kept in this script's context. */
+        char *eq=strchr(expanded,'=');
+        if(eq&&eq!=expanded){
+            int valid=1; size_t name_len=(size_t)(eq-expanded);
+            for(char *p=expanded;p<eq;p++)if(!(isalnum((unsigned char)*p)||*p=='_')||(p==expanded&&isdigit((unsigned char)*p)))valid=0;
+            char *value=eq+1; size_t value_len=strlen(value); char captured[SCRIPT_VALUE];
+            int substitution = script_capture_substitution(value, captured, sizeof(captured));
+            if (substitution < 0) valid = 0;
+            if (substitution == 0) {
+                if(value_len>=2 && ((value[0]=='"'&&value[value_len-1]=='"') || (value[0]=='\''&&value[value_len-1]=='\''))){ value[value_len-1]='\0'; value++; }
+                else for(size_t j=0;j<value_len;j++)if(isspace((unsigned char)value[j]))valid=0;
+            } else if (substitution > 0) value = captured;
+            if(valid&&name_len<64){ *eq='\0'; script_set_var(ctx,expanded,value); tab->last_status=0; continue; }
+        }
+        start_command(tab,expanded);
+        while(tab->command.active&&!tab->command.stopped){ service_tab(tab); if(tab->command.active){struct timespec ts={0,10000000L};nanosleep(&ts,NULL);} }
+        if(tab->command.stopped){add_line(&tab->buffer,"script: command stopped; aborting script");return 1;}
+    }
+    return 0;
+}
+static int run_script_file(TerminalTab *tab,const char *requested,int argc,char **argv)
+{
+    char path[PATH_MAX];
+    if(requested[0]=='/')snprintf(path,sizeof(path),"%s",requested);
+    else if(requested[0]=='~'&&(requested[1]=='/'||requested[1]=='\0')){const char *h=getenv("HOME");if(!h)h="/";snprintf(path,sizeof(path),"%s%s",h,requested+1);}
+    else if(snprintf(path,sizeof(path),"%s/%s",tab->cwd,requested)>=(int)sizeof(path)){add_line(&tab->buffer,"script: path is too long");tab->last_status=1;return 1;}
+    FILE *fp=fopen(path,"r"); if(!fp){char msg[LINE_SIZE];snprintf(msg,sizeof(msg),"script: %s: %s",requested,strerror(errno));add_line(&tab->buffer,msg);tab->last_status=1;return 1;}
+    char lines[SCRIPT_MAX_LINES][INPUT_SIZE]; int count=0,err=0; char buf[INPUT_SIZE];
+    while(fgets(buf,sizeof(buf),fp)){ if(count>=SCRIPT_MAX_LINES){err=1;break;} size_t n=strlen(buf); if(n&&buf[n-1]=='\n')buf[--n]='\0'; else if(!feof(fp)){err=1;break;} if(n&&buf[n-1]=='\r')buf[--n]='\0'; snprintf(lines[count++],INPUT_SIZE,"%s",buf); }
+    if(ferror(fp))err=1;
+    fclose(fp);
+    if(err){add_format(&tab->buffer,"script: %s: read error or script exceeds limits",requested);tab->last_status=1;return 1;}
+    /* Validate if/elif/else/fi nesting before executing any command. */
+    int stack[SCRIPT_MAX_LINES],seen_else[SCRIPT_MAX_LINES],top=0;
+    for(int i=0;i<count;i++){
+        char tmp[INPUT_SIZE]; memcpy(tmp,lines[i],INPUT_SIZE); char *s=script_trim(tmp);
+        if(!strncmp(s,"if ",3)){
+            if(top>=SCRIPT_MAX_LINES){add_line(&tab->buffer,"script: too many nested if blocks");tab->last_status=2;return 2;}
+            stack[top]=i; seen_else[top]=0; top++;
+        } else if(!strcmp(s,"fi")){
+            if(!top){char msg[LINE_SIZE];snprintf(msg,sizeof(msg),"%s:%d: unexpected fi",requested,i+1);add_line(&tab->buffer,msg);tab->last_status=2;return 2;}
+            top--;
+        } else if(!strcmp(s,"else")||!strncmp(s,"elif ",5)){
+            if(!top || seen_else[top-1]){
+                char msg[LINE_SIZE];snprintf(msg,sizeof(msg),"%s:%d: unexpected or misplaced %s",requested,i+1,s);add_line(&tab->buffer,msg);tab->last_status=2;return 2;
+            }
+            if(!strcmp(s,"else"))seen_else[top-1]=1;
+        }
+    }
+    if(top){char msg[LINE_SIZE];snprintf(msg,sizeof(msg),"%s:%d: syntax error: missing fi",requested,stack[top-1]+1);add_line(&tab->buffer,msg);tab->last_status=2;return 2;}
+    ScriptContext ctx; memset(&ctx,0,sizeof(ctx)); ctx.argc=argc; for(int i=0;i<argc&&i<MAX_ARGS;i++)ctx.args[i]=argv[i];
+    int rc=script_exec_range(tab,&ctx,lines,count,0,count,requested);
+    tab->last_status=ctx.exit_requested?ctx.exit_status:(rc?rc:tab->last_status);
+    return tab->last_status;
+}
+
 static void start_command(TerminalTab *tab, const char *original_command)
 {
     if (tab->command.active && !tab->command.stopped) {
@@ -2342,98 +2557,17 @@ static void start_command(TerminalTab *tab, const char *original_command)
     }
 
     if (strcmp(argv[0], "source") == 0 || strcmp(argv[0], ".") == 0) {
-        if (argc != 2) {
-            add_line(&tab->buffer, "source: usage: source filename");
-            tab->last_status = 2;
-            return;
-        }
-        char script_path[PATH_MAX];
-        const char *requested_path = argv[1];
-        if (requested_path[0] == '/') {
-            if (snprintf(script_path, sizeof(script_path), "%s",
-                         requested_path) >= (int)sizeof(script_path)) {
-                add_line(&tab->buffer, "source: script path is too long");
-                tab->last_status = 1;
-                return;
-            }
-        } else if (requested_path[0] == '~' &&
-                   (requested_path[1] == '/' || requested_path[1] == '\0')) {
-            const char *home = getenv("HOME");
-            if (home == NULL) home = "/";
-            if (snprintf(script_path, sizeof(script_path), "%s%s",
-                         home, requested_path + 1) >= (int)sizeof(script_path)) {
-                add_line(&tab->buffer, "source: script path is too long");
-                tab->last_status = 1;
-                return;
-            }
-        } else if (snprintf(script_path, sizeof(script_path), "%s/%s",
-                            tab->cwd, requested_path) >= (int)sizeof(script_path)) {
-            add_line(&tab->buffer, "source: script path is too long");
-            tab->last_status = 1;
-            return;
-        }
-        FILE *script = fopen(script_path, "r");
-        if (script == NULL) {
-            char message[LINE_SIZE];
-            snprintf(message, sizeof(message), "source: %s: %s",
-                     requested_path, strerror(errno));
-            add_line(&tab->buffer, message);
-            tab->last_status = 1;
-            return;
-        }
-        char script_line[INPUT_SIZE];
-        unsigned long line_number = 0;
-        int script_failed = 0;
-        while (fgets(script_line, sizeof(script_line), script) != NULL) {
-            ++line_number;
-            size_t n = strlen(script_line);
-            if (n > 0 && script_line[n - 1] == '\n')
-                script_line[--n] = '\0';
-            else if (!feof(script)) {
-                char message[LINE_SIZE];
-                snprintf(message, sizeof(message),
-                         "source: %s:%lu: line too long", argv[1], line_number);
-                add_line(&tab->buffer, message);
-                script_failed = 1;
-                int ch;
-                while ((ch = fgetc(script)) != '\n' && ch != EOF) {}
-                continue;
-            }
-            char *line = script_line;
-            while (*line == ' ' || *line == '\t' || *line == '\r') ++line;
-            if (*line == '\0' || *line == '#') continue;
-            /* Strip trailing CR for Windows-created script files. */
-            n = strlen(line);
-            while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
-                             line[n - 1] == '\r')) line[--n] = '\0';
-            if (*line == '\0') continue;
-            if (strcmp(line, "exit") == 0) break;
-            start_command(tab, line);
-            /* The existing command engine is asynchronous; wait for each script
-               command to finish before interpreting the next line. */
-            while (tab->command.active && !tab->command.stopped) {
-                service_tab(tab);
-                if (tab->command.active) {
-                    struct timespec pause_time = {0, 10000000L};
-                    (void)nanosleep(&pause_time, NULL);
-                }
-            }
-            if (tab->command.stopped) {
-                add_line(&tab->buffer, "source: command stopped; script paused.");
-                script_failed = 1;
-                break;
-            }
-            if (tab->last_status != 0)
-                script_failed = 1;
-        }
-        if (ferror(script)) {
-            char message[LINE_SIZE];
-            snprintf(message, sizeof(message), "source: error reading %s", argv[1]);
-            add_line(&tab->buffer, message);
-            script_failed = 1;
-        }
-        fclose(script);
-        tab->last_status = script_failed ? 1 : 0;
+        if (argc < 2) { add_line(&tab->buffer, "source: usage: source filename [args ...]"); tab->last_status=2; return; }
+        (void)run_script_file(tab, argv[1], argc-2, &argv[2]);
+        return;
+    }
+
+    /* Task 11: bash script.sh and executable ./script.sh are interpreted here. */
+    if ((strcmp(argv[0], "bash") == 0 && argc >= 2 && argv[1][0] != '-') ||
+        (argv[0][0] == '.' && argv[0][1] == '/')) {
+        int script_index = strcmp(argv[0], "bash") == 0 ? 1 : 0;
+        int nscript = argc - script_index - 1;
+        (void)run_script_file(tab, argv[script_index], nscript, &argv[script_index+1]);
         return;
     }
 
