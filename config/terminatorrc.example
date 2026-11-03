@@ -1,0 +1,12 @@
+# Terminator keyboard shortcut configuration
+# Copy this file to ~/.terminatorrc
+
+ctrl_a = Alt+A
+ctrl_e = Alt+E
+ctrl_u = Ctrl+U
+ctrl_k = Ctrl+K
+ctrl_w = Ctrl+W
+ctrl_l = Ctrl+L
+ctrl_d = Ctrl+D
+copy = Ctrl+Shift+C
+paste = Ctrl+Shift+V
