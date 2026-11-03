@@ -28,7 +28,7 @@
 #include <sys/file.h>
 
 #define MAX_TABS 9
-#define MAX_LINES 1000
+#define MAX_LINES 4096
 #define LINE_SIZE 1024
 #define INPUT_SIZE 1024
 #define MAX_ARGS 128
@@ -155,7 +155,7 @@ typedef struct {
 } TextSelection;
 static TextSelection text_selection;
 
-/* Default bindings can be overridden in ~/.terminatorrc. */
+/* Task 7: default key bindings, optionally overridden by ~/.terminatorrc. */
 typedef struct { KeySym key; unsigned int modifiers; } KeyBinding;
 static KeyBinding binding_ctrl_a, binding_ctrl_e, binding_ctrl_u, binding_ctrl_k;
 static KeyBinding binding_ctrl_w, binding_ctrl_l, binding_ctrl_d;
@@ -222,30 +222,28 @@ static int binding_equal(KeyBinding a, KeyBinding b)
     return a.key == b.key && a.modifiers == b.modifiers;
 }
 
+/* Accept forms such as Ctrl+A, Ctrl+Shift+C, Alt+X, or F5. */
 static int parse_binding(const char *value, KeyBinding *out)
 {
     char copy[80];
-    if (!value || strlen(value) >= sizeof(copy)) return 0;
+    if (!value || !out || strlen(value) >= sizeof(copy)) return 0;
     strcpy(copy, value);
     char *save = NULL;
     char *token = strtok_r(copy, "+", &save);
-    unsigned int mods = 0;
+    unsigned int modifiers = 0;
     KeySym key = NoSymbol;
     while (token) {
         if (strcasecmp(token, "Ctrl") == 0 || strcasecmp(token, "Control") == 0)
-            mods |= ControlMask;
+            modifiers |= ControlMask;
         else if (strcasecmp(token, "Shift") == 0)
-            mods |= ShiftMask;
+            modifiers |= ShiftMask;
         else if (strcasecmp(token, "Alt") == 0)
-            mods |= Mod1Mask;
+            modifiers |= Mod1Mask;
         else {
             KeySym candidate = XStringToKeysym(token);
             if (candidate == NoSymbol && strlen(token) == 1)
                 candidate = (KeySym)(unsigned char)token[0];
             if (candidate == NoSymbol || key != NoSymbol) return 0;
-            /* XLookupKeysym(event, 0) returns the unshifted keysym for
-               alphabetic keys (for example XK_q), even when the config
-               spells the key as Ctrl+Q (XK_Q). Normalize A-Z to a-z. */
             if (candidate >= XK_A && candidate <= XK_Z)
                 candidate = candidate - XK_A + XK_a;
             key = candidate;
@@ -253,12 +251,14 @@ static int parse_binding(const char *value, KeyBinding *out)
         token = strtok_r(NULL, "+", &save);
     }
     if (key == NoSymbol) return 0;
-    out->key = key; out->modifiers = mods;
+    out->key = key;
+    out->modifiers = modifiers;
     return 1;
 }
 
 static void load_key_bindings(void)
 {
+    /* Always begin with the PDF defaults. */
     binding_ctrl_a = (KeyBinding){XK_a, ControlMask};
     binding_ctrl_e = (KeyBinding){XK_e, ControlMask};
     binding_ctrl_u = (KeyBinding){XK_u, ControlMask};
@@ -272,50 +272,77 @@ static void load_key_bindings(void)
     const char *home = getenv("HOME");
     if (!home) return;
     char path[PATH_MAX];
-    if (snprintf(path, sizeof(path), "%s/.terminatorrc", home) >= (int)sizeof(path)) return;
-    FILE *fp = fopen(path, "r");
-    if (!fp) return;
-    char line[160];
-    KeyBinding parsed;
-    while (fgets(line, sizeof(line), fp)) {
-        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = '\0';
-        char *eq = strchr(line, '='); if (!eq) continue;
-        *eq++ = '\0';
-        char *name = line;
-        while (*name == ' ' || *name == '\t') name++;
-        char *name_end = name + strlen(name);
-        while (name_end > name && (name_end[-1] == ' ' || name_end[-1] == '\t'))
-            *--name_end = '\0';
-        while (*eq == ' ' || *eq == '\t') eq++;
-        char *value_end = eq + strlen(eq);
-        while (value_end > eq && (value_end[-1] == ' ' || value_end[-1] == '\t'))
-            *--value_end = '\0';
-        KeyBinding *target = NULL;
-        if (!strcmp(name,"ctrl_a")) target=&binding_ctrl_a;
-        else if (!strcmp(name,"ctrl_e")) target=&binding_ctrl_e;
-        else if (!strcmp(name,"ctrl_u")) target=&binding_ctrl_u;
-        else if (!strcmp(name,"ctrl_k")) target=&binding_ctrl_k;
-        else if (!strcmp(name,"ctrl_w")) target=&binding_ctrl_w;
-        else if (!strcmp(name,"ctrl_l")) target=&binding_ctrl_l;
-        else if (!strcmp(name,"ctrl_d")) target=&binding_ctrl_d;
-        else if (!strcmp(name,"copy")) target=&binding_copy;
-        else if (!strcmp(name,"paste")) target=&binding_paste;
-        if (!target) continue;
-        if (!parse_binding(eq, &parsed)) {
-            fprintf(stderr,"terminator: invalid binding for %s; using default\n",name);
-            continue;
-        }
-        int conflict = 0;
-        KeyBinding *all[] = {&binding_ctrl_a,&binding_ctrl_e,&binding_ctrl_u,&binding_ctrl_k,
-            &binding_ctrl_w,&binding_ctrl_l,&binding_ctrl_d,&binding_copy,&binding_paste};
-        for (size_t i=0;i<sizeof(all)/sizeof(all[0]);i++)
-            if (all[i] != target && binding_equal(parsed,*all[i])) conflict=1;
-        if (conflict) {
-            fprintf(stderr,"terminator: conflicting binding for %s; using default\n",name);
-            continue;
-        }
-        *target=parsed;
+    int path_len = snprintf(path, sizeof(path), "%s/.terminatorrc", home);
+    if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
+        fprintf(stderr, "terminator: config path is too long; using default hotkeys\n");
+        return;
     }
+    FILE *fp = fopen(path, "r");
+    if (!fp) return; /* A missing config file is normal. */
+
+    char line[160];
+    unsigned int line_number = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        line_number++;
+        if (!strchr(line, '\n') && !feof(fp)) {
+            int ch;
+            while ((ch = fgetc(fp)) != '\n' && ch != EOF) {}
+            fprintf(stderr, "terminator: config line %u is too long; ignored\n", line_number);
+            continue;
+        }
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        char *start = line;
+        while (*start == ' ' || *start == '\t') start++;
+        char *end = start + strlen(start);
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n'))
+            *--end = '\0';
+        if (*start == '\0') continue;
+        char *equals = strchr(start, '=');
+        if (!equals) {
+            fprintf(stderr, "terminator: invalid config line %u; ignored\n", line_number);
+            continue;
+        }
+        *equals++ = '\0';
+        char *name_end = start + strlen(start);
+        while (name_end > start && (name_end[-1] == ' ' || name_end[-1] == '\t')) *--name_end = '\0';
+        while (*equals == ' ' || *equals == '\t') equals++;
+        char *value_end = equals + strlen(equals);
+        while (value_end > equals && (value_end[-1] == ' ' || value_end[-1] == '\t')) *--value_end = '\0';
+
+        KeyBinding *target = NULL;
+        if (strcmp(start, "ctrl_a") == 0) target = &binding_ctrl_a;
+        else if (strcmp(start, "ctrl_e") == 0) target = &binding_ctrl_e;
+        else if (strcmp(start, "ctrl_u") == 0) target = &binding_ctrl_u;
+        else if (strcmp(start, "ctrl_k") == 0) target = &binding_ctrl_k;
+        else if (strcmp(start, "ctrl_w") == 0) target = &binding_ctrl_w;
+        else if (strcmp(start, "ctrl_l") == 0) target = &binding_ctrl_l;
+        else if (strcmp(start, "ctrl_d") == 0) target = &binding_ctrl_d;
+        else if (strcmp(start, "copy") == 0) target = &binding_copy;
+        else if (strcmp(start, "paste") == 0) target = &binding_paste;
+        else {
+            fprintf(stderr, "terminator: unknown hotkey '%s' on config line %u; ignored\n", start, line_number);
+            continue;
+        }
+
+        KeyBinding parsed;
+        if (!parse_binding(equals, &parsed)) {
+            fprintf(stderr, "terminator: invalid binding for %s on line %u; using default/current binding\n", start, line_number);
+            continue;
+        }
+        KeyBinding *all[] = {&binding_ctrl_a, &binding_ctrl_e, &binding_ctrl_u, &binding_ctrl_k,
+            &binding_ctrl_w, &binding_ctrl_l, &binding_ctrl_d, &binding_copy, &binding_paste};
+        int conflict = 0;
+        for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+            if (all[i] != target && binding_equal(parsed, *all[i])) { conflict = 1; break; }
+        }
+        if (conflict) {
+            fprintf(stderr, "terminator: conflicting binding for %s on line %u; using default/current binding\n", start, line_number);
+            continue;
+        }
+        *target = parsed;
+    }
+    if (ferror(fp)) fprintf(stderr, "terminator: error reading %s\n", path);
     fclose(fp);
 }
 
@@ -323,8 +350,8 @@ static int binding_pressed(XKeyEvent *event, KeySym key, KeyBinding binding)
 {
     unsigned int state = event->state & (ControlMask | ShiftMask | Mod1Mask);
     KeySym actual = XLookupKeysym(event, 0);
-    return actual == binding.key && state == binding.modifiers &&
-           (key == binding.key || actual == binding.key);
+    (void)key;
+    return actual == binding.key && state == binding.modifiers;
 }
 
 static void paste_clipboard(void)
@@ -649,30 +676,96 @@ static void history_load(void)
     }
 }
 
+static int is_history_builtin_line(const char *command)
+{
+    if (command == NULL) return 0;
+    while (*command == ' ' || *command == '\t') command++;
+    return strncmp(command, "history", 7) == 0 &&
+           (command[7] == '\0' || command[7] == ' ' || command[7] == '\t');
+}
+
 static void history_persist(const char *command)
 {
+    /* Keep the history command in interactive navigation, but not on disk. */
+    if (is_history_builtin_line(command)) return;
+
     char path[PATH_MAX];
     history_file_path(path, sizeof(path));
-    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+
+    int fd = open(path, O_RDWR | O_CREAT, 0600);
     if (fd == -1) return;
-    if (flock(fd, LOCK_EX) == 0) {
-        /* Keep the on-disk format one command per line. */
-        char line[INPUT_SIZE + 2];
-        size_t n = 0;
-        for (size_t i = 0; command[i] && n < INPUT_SIZE; ++i) {
-            char c = command[i];
-            line[n++] = (c == '\n' || c == '\r') ? ' ' : c;
-        }
-        line[n++] = '\n';
-        size_t written = 0;
-        while (written < n) {
-            ssize_t result = write(fd, line + written, n - written);
-            if (result < 0 && errno == EINTR) continue;
-            if (result <= 0) break;
-            written += (size_t)result;
-        }
-        (void)flock(fd, LOCK_UN);
+
+    if (flock(fd, LOCK_EX) == -1) {
+        close(fd);
+        return;
     }
+
+    /*
+     * Trim while holding the file lock.  Keeping the newest MAX_HISTORY - 1
+     * existing lines leaves room for the command being appended.  Rewriting
+     * the same locked inode avoids races between simultaneous Terminator
+     * instances that could occur with a temporary-file/rename approach.
+     */
+    char **entries = calloc(MAX_HISTORY, sizeof(*entries));
+    if (entries == NULL) {
+        (void)flock(fd, LOCK_UN);
+        close(fd);
+        return;
+    }
+
+    int read_fd = dup(fd);
+    FILE *input = read_fd == -1 ? NULL : fdopen(read_fd, "r");
+    size_t count = 0;
+    size_t next = 0;
+    char *line = NULL;
+    size_t line_capacity = 0;
+
+    if (input != NULL) {
+        while (getline(&line, &line_capacity, input) != -1) {
+            size_t len = strcspn(line, "\r\n");
+            line[len] = '\0';
+            if (len == 0) continue;
+            if (len >= INPUT_SIZE) len = INPUT_SIZE - 1;
+
+            char *copy = malloc(len + 1);
+            if (copy == NULL) continue;
+            memcpy(copy, line, len);
+            copy[len] = '\0';
+
+            free(entries[next]);
+            entries[next] = copy;
+            next = (next + 1) % (MAX_HISTORY - 1);
+            if (count < MAX_HISTORY - 1) count++;
+        }
+        free(line);
+        fclose(input);
+    } else if (read_fd != -1) {
+        close(read_fd);
+    }
+
+    char clean_command[INPUT_SIZE];
+    size_t command_len = 0;
+    while (command[command_len] && command_len < INPUT_SIZE - 1) {
+        char c = command[command_len];
+        clean_command[command_len] = (c == '\n' || c == '\r') ? ' ' : c;
+        command_len++;
+    }
+    clean_command[command_len] = '\0';
+
+    if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) != (off_t)-1) {
+        size_t first = (next + (MAX_HISTORY - 1) - count) % (MAX_HISTORY - 1);
+        for (size_t i = 0; i < count; ++i) {
+            size_t index = (first + i) % (MAX_HISTORY - 1);
+            if (entries[index] != NULL) {
+                (void)dprintf(fd, "%s\n", entries[index]);
+            }
+        }
+        (void)dprintf(fd, "%s\n", clean_command);
+    }
+
+    for (size_t i = 0; i < MAX_HISTORY; ++i) free(entries[i]);
+    free(entries);
+    (void)flock(fd, LOCK_UN);
     close(fd);
 }
 
@@ -711,14 +804,6 @@ static void history_add(const char *command)
     if (command == NULL || command[0] == '\0')
         return;
 
-    /* Do not add the history built-in itself to the command history. */
-    const char *first = command;
-    while (*first != '\0' && isspace((unsigned char)*first))
-        ++first;
-    if (strncmp(first, "history", 7) == 0 &&
-        (first[7] == '\0' || isspace((unsigned char)first[7]) || first[7] == '|'))
-        return;
-
     history_lock();
     CommandHistory *history = (process_mode && shared_history) ?
                               &shared_history->history : &command_history;
@@ -744,21 +829,27 @@ static void record_command_line(TerminalTab *tab, const char *command)
 static void show_history(TerminalTab *tab)
 {
     char snapshot[1000][INPUT_SIZE];
+    size_t shown = 0;
+
     history_lock();
     CommandHistory *history = (process_mode && shared_history) ?
                               &shared_history->history : &command_history;
-    size_t shown = history->count;
-    if (shown > 1000) shown = 1000;
-    size_t first = (history->next + MAX_HISTORY - shown) % MAX_HISTORY;
-    for (size_t i = 0; i < shown; i++) {
-        size_t index = (first + i) % MAX_HISTORY;
-        snprintf(snapshot[i], sizeof(snapshot[i]), "%s", history->commands[index]);
+
+    /* Walk newest-to-oldest, skipping history invocations, until 1000 real
+       commands have been collected. Then reverse them for chronological output. */
+    for (size_t offset = 0; offset < history->count && shown < 1000; ++offset) {
+        size_t index = (history->next + MAX_HISTORY - 1 - offset) % MAX_HISTORY;
+        const char *candidate = history->commands[index];
+        if (is_history_builtin_line(candidate)) continue;
+        snprintf(snapshot[shown], sizeof(snapshot[shown]), "%s", candidate);
+        shown++;
     }
     history_unlock();
 
     char line[LINE_SIZE];
-    for (size_t i = 0; i < shown; i++) {
-        snprintf(line, sizeof(line), "%zu  %.1000s", i + 1, snapshot[i]);
+    for (size_t i = 0; i < shown; ++i) {
+        snprintf(line, sizeof(line), "%zu  %.1000s", shown - i,
+                 snapshot[shown - i - 1]);
         add_line(&tab->buffer, line);
     }
     tab->last_status = 0;
@@ -3237,12 +3328,6 @@ static void handle_key(XKeyEvent *event)
         return;
     }
 
-    if (ctrl && (key == XK_l || key == XK_L)) {
-        tab->buffer.count = 0;
-        tab->scroll_offset = 0;
-        return;
-    }
-
     if (key == XK_Escape) {
         running = 0;
         return;
@@ -3468,7 +3553,8 @@ int main(int argc, char **argv)
 
     XSetFont(display, gc, font->fid);
 
-    memset(&command_history, 0, sizeof(command_history));
+    /* command_history was initialized by static storage and populated by
+       history_load(); do not clear it here or Thread Mode loses persisted history. */
     init_tab(&tabs[0]);
     if (process_mode) {
         if (start_process_tab(0) == -1) {
